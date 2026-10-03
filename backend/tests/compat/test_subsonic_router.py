@@ -102,6 +102,7 @@ async def test_extensions_public_no_auth(compat_env):
     assert "apiKeyAuthentication" in names
     assert "formPost" in names
     assert "transcoding" in names
+    assert "songLyrics" in names
 
 
 # ----- enablement -----
