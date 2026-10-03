@@ -34,8 +34,8 @@ ARG DROPPEDNEEDLE_SOURCE_REVISION=unknown
 
 LABEL org.opencontainers.image.title="DroppedNeedle" \
       org.opencontainers.image.description="Music request and discovery app with a built-in native library + download engine" \
-      org.opencontainers.image.url="https://github.com/DroppedNeedle/DroppedNeedle" \
-      org.opencontainers.image.source="https://github.com/DroppedNeedle/DroppedNeedle" \
+      org.opencontainers.image.url="https://github.com/vargabp/DroppedNeedle" \
+      org.opencontainers.image.source="https://github.com/vargabp/DroppedNeedle" \
       org.opencontainers.image.version="${COMMIT_TAG}" \
       org.opencontainers.image.created="${BUILD_DATE}" \
       org.opencontainers.image.licenses="AGPL-3.0" \
