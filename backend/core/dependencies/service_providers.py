@@ -387,9 +387,13 @@ def get_genre_projection_service() -> "GenreProjectionService":
 
 @singleton
 def get_lyrics_projection_service() -> "LyricsProjectionService":
+    from core.config import get_settings
     from services.native.lyrics_projection_service import LyricsProjectionService
 
-    return LyricsProjectionService(get_lrclib_repository())
+    return LyricsProjectionService(
+        get_lrclib_repository(),
+        duration_tolerance_seconds=get_settings().lrclib_duration_tolerance_seconds,
+    )
 
 
 @singleton

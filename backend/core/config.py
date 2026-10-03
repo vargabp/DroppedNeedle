@@ -71,6 +71,15 @@ class Settings(BaseSettings):
         description="Proactively warm per-user Discover/Home in the background through the day (kill switch)."
     )
 
+    lrclib_duration_tolerance_seconds: float = Field(
+        default=2.0,
+        ge=0.0,
+        description=(
+            "Maximum duration difference in seconds allowed when validating "
+            "an exact LRCLIB lyrics match."
+        ),
+    )
+
     port: int = Field(default=8688)
     debug: bool = Field(default=False)
     log_level: str = Field(default="INFO")

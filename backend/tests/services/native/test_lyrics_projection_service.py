@@ -167,6 +167,34 @@ async def test_mismatched_name_or_duration_is_not_admitted() -> None:
 
 
 @pytest.mark.asyncio
+async def test_duration_tolerance_can_be_overridden() -> None:
+    repository = AsyncMock()
+    repository.get_exact_lyrics.return_value = LyricsLookupResult(
+        found=True,
+        candidate=_candidate(duration_seconds=272.5),
+    )
+
+    default_result = await LyricsProjectionService(repository).project(
+        settings=LyricsManagementSettings(enabled=True),
+        canonical_release=_release(),
+        canonical_track=_track(),
+        duration_seconds=270.0,
+    )
+    overridden_result = await LyricsProjectionService(
+        repository,
+        duration_tolerance_seconds=3.0,
+    ).project(
+        settings=LyricsManagementSettings(enabled=True),
+        canonical_release=_release(),
+        canonical_track=_track(),
+        duration_seconds=270.0,
+    )
+
+    assert default_result.status == "mismatch"
+    assert overridden_result.status == "available"
+
+
+@pytest.mark.asyncio
 async def test_absence_and_outage_have_distinct_statuses() -> None:
     repository = AsyncMock()
     repository.get_exact_lyrics.return_value = LyricsLookupResult(found=False)

@@ -15,7 +15,6 @@ from models.library_management_canonical import (
 from models.library_management_enrichment import LyricsProjection
 from repositories.protocols.lrclib import LrclibRepositoryProtocol
 
-_DURATION_TOLERANCE_SECONDS = 2.0
 _TYPOGRAPHIC_APOSTROPHES = str.maketrans(
     {
         "\u02bc": "'",
@@ -38,8 +37,13 @@ def _artist_credit(credits) -> str:  # noqa: ANN001
 
 
 class LyricsProjectionService:
-    def __init__(self, repository: LrclibRepositoryProtocol) -> None:
+    def __init__(
+        self,
+        repository: LrclibRepositoryProtocol,
+        duration_tolerance_seconds: float = 2.0,
+    ) -> None:
         self._repository = repository
+        self._duration_tolerance_seconds = duration_tolerance_seconds
 
     async def project(
         self,
@@ -94,7 +98,7 @@ class LyricsProjectionService:
         )
         if expected != received or (
             abs(candidate.duration_seconds - duration_seconds)
-            > _DURATION_TOLERANCE_SECONDS
+            > self._duration_tolerance_seconds
         ):
             return LyricsProjection(
                 status="mismatch",

@@ -72,8 +72,32 @@ class TestLogLevelValidator:
         settings = _make_settings(log_level="Warning")
         assert settings.log_level == "WARNING"
 
+# C. LRCLIB duration tolerance
 
-# C. load_from_file - type validation
+class TestLrclibDurationTolerance:
+    def test_default_is_two_seconds(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("LRCLIB_DURATION_TOLERANCE_SECONDS", raising=False)
+
+        settings = _make_settings(_env_file=None)
+
+        assert settings.lrclib_duration_tolerance_seconds == 2.0
+
+    def test_environment_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("LRCLIB_DURATION_TOLERANCE_SECONDS", "3")
+
+        settings = _make_settings(_env_file=None)
+
+        assert settings.lrclib_duration_tolerance_seconds == 3.0
+
+    def test_negative_value_is_rejected(self) -> None:
+        with pytest.raises(PydanticValidationError):
+            _make_settings(
+                _env_file=None,
+                lrclib_duration_tolerance_seconds=-1,
+            )
+
+
+# D. load_from_file - type validation
 
 class TestLoadFromFileTypeValidation:
     def test_wrong_type_raises_configuration_error(self, tmp_path: Path) -> None:
@@ -182,7 +206,7 @@ class TestLoadFromFileTypeValidation:
         assert settings.port == original_port
 
 
-# D. Log level application at startup
+# E. Log level application at startup
 
 class TestLogLevelApplication:
     def test_log_level_applied_to_root_logger(self) -> None:
@@ -208,7 +232,7 @@ class TestLogLevelApplication:
             root.setLevel(original)
 
 
-# E. get_settings() cache safety
+# F. get_settings() cache safety
 
 class TestGetSettingsCacheSafety:
     def test_failed_load_does_not_poison_cache(self, tmp_path: Path) -> None:
