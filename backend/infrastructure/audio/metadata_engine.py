@@ -1870,6 +1870,16 @@ class AudioMetadataEngine:
         for raw in current.raw_tags:
             folded_key = raw.key.casefold()
             id3_qualified_base = folded_key.split(":", 1)[0]
+            # The script namespace is text-only. Keep opaque GEOB payloads
+            # and invalid qualified comment keys in the native snapshot,
+            # without exposing them as writable custom text. Inspect the
+            # native key before stripping TXXX: so real custom text named
+            # GEOB:* still receives ordinary validation.
+            if current.native_tags.storage_kind == "id3" and (
+                id3_qualified_base == "geob"
+                or (id3_qualified_base == "comm" and "\x00" in raw.key)
+            ):
+                continue
             if (
                 raw.value_kind != "text"
                 or folded_key in reserved
