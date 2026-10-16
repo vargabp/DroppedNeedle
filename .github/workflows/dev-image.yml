@@ -60,6 +60,7 @@ jobs:
           push: false
           build-args: |
             COMMIT_TAG=dev-${{ steps.sha.outputs.short }}
+            DROPPEDNEEDLE_SOURCE_REVISION=${{ github.sha }}
             BUILD_DATE=${{ steps.date.outputs.timestamp }}
           cache-from: type=gha,scope=${{ matrix.platform }}
           cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
@@ -112,10 +113,14 @@ jobs:
         env:
           SHORT_SHA: ${{ steps.sha.outputs.short }}
         run: |
+          IMAGE_NAMESPACE="${GITHUB_REPOSITORY,,}"
+          if [ "$IMAGE_NAMESPACE" != "droppedneedle/droppedneedle" ]; then
+            IMAGE_NAMESPACE="$IMAGE_NAMESPACE-fork"
+          fi
           {
             echo "TAGS<<EOF"
-            echo "ghcr.io/${GITHUB_REPOSITORY,,}:dev"
-            echo "ghcr.io/${GITHUB_REPOSITORY,,}:dev-$SHORT_SHA"
+            echo "ghcr.io/${IMAGE_NAMESPACE}:dev"
+            echo "ghcr.io/${IMAGE_NAMESPACE}:dev-$SHORT_SHA"
             if [ "${GITHUB_REPOSITORY,,}" = "droppedneedle/droppedneedle" ]; then
             if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
               echo "droppedneedle/droppedneedle:dev"
@@ -134,6 +139,7 @@ jobs:
           tags: ${{ env.TAGS }}
           build-args: |
             COMMIT_TAG=dev-${{ steps.sha.outputs.short }}
+            DROPPEDNEEDLE_SOURCE_REVISION=${{ github.sha }}
             BUILD_DATE=${{ steps.date.outputs.timestamp }}
           cache-from: |
             type=gha,scope=linux/amd64
