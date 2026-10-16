@@ -1,6 +1,7 @@
 """Typed, cache-aside LRCLIB reads for optional Library Management lyrics."""
 
 import hashlib
+import os
 
 import httpx
 import msgspec
@@ -16,7 +17,10 @@ from infrastructure.resilience.retry import CircuitBreaker, with_retry
 from models.library_management_enrichment import LyricsCandidate, LyricsLookupResult
 from repositories.lrclib_models import LrclibLyricsResponse
 
-LRCLIB_API_URL = "https://lrclib.net"
+LRCLIB_API_URL = os.getenv(
+    "LRCLIB_API_URL",
+    "https://lrclib.net"
+)
 _SOURCE = "lrclib"
 _POSITIVE_TTL_SECONDS = 7 * 24 * 60 * 60
 _NEGATIVE_TTL_SECONDS = 6 * 60 * 60
@@ -25,7 +29,13 @@ _MAX_LYRICS_CHARACTERS = 1_000_000
 
 # LRCLIB publishes no numeric request allowance. This conservative client-side ceiling
 # is intentionally below ordinary interactive use and is not a claim about its limit.
-_lrclib_rate_limiter = TokenBucketRateLimiter(rate=1.0, capacity=2)
+# Can be configurable when, for example, used with a local instance of LRCLIB or a paid plan with higher allowance.
+LRCLIB_RATE_LIMIT = float(os.getenv("LRCLIB_RATE_LIMIT", "1.0"))
+
+_lrclib_rate_limiter = TokenBucketRateLimiter(
+    rate=LRCLIB_RATE_LIMIT,
+    capacity=max(2, int(LRCLIB_RATE_LIMIT)),
+)
 _lrclib_breaker = CircuitBreaker(
     failure_threshold=5,
     success_threshold=2,

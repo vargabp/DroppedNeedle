@@ -114,11 +114,13 @@ jobs:
         run: |
           {
             echo "TAGS<<EOF"
-            echo "ghcr.io/droppedneedle/droppedneedle:dev"
-            echo "ghcr.io/droppedneedle/droppedneedle:dev-$SHORT_SHA"
+            echo "ghcr.io/${GITHUB_REPOSITORY,,}:dev"
+            echo "ghcr.io/${GITHUB_REPOSITORY,,}:dev-$SHORT_SHA"
+            if [ "${GITHUB_REPOSITORY,,}" = "droppedneedle/droppedneedle" ]; then
             if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
               echo "droppedneedle/droppedneedle:dev"
               echo "droppedneedle/droppedneedle:dev-$SHORT_SHA"
+            fi
             fi
             echo "EOF"
           } >> "$GITHUB_ENV"
