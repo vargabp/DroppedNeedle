@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from time import monotonic
 from typing import AsyncIterator, Awaitable, Callable
 
@@ -11,6 +12,9 @@ logger = logging.getLogger(__name__)
 
 INTERACTIVE_QUIET_PERIOD_SECONDS = 5.0
 INTERACTIVE_MAX_DEFERRAL_SECONDS = 120.0
+_admitted_gates: ContextVar[frozenset[int]] = ContextVar(
+    "background_workload_admitted_gates", default=frozenset()
+)
 
 
 class BackgroundWorkloadGate:
@@ -28,6 +32,7 @@ class BackgroundWorkloadGate:
         *,
         interactive_quiet_period: float = INTERACTIVE_QUIET_PERIOD_SECONDS,
         interactive_max_deferral: float = INTERACTIVE_MAX_DEFERRAL_SECONDS,
+        unit_admission_enabled: bool = False,
     ) -> None:
         self._available = asyncio.Event()
         self._available.set()
@@ -38,6 +43,7 @@ class BackgroundWorkloadGate:
         self._active_interactive_requests = 0
         self._interactive_quiet_period = max(0.0, interactive_quiet_period)
         self._interactive_max_deferral = max(0.0, interactive_max_deferral)
+        self._unit_admission_enabled = unit_admission_enabled
         self.deferred_waits = 0
         self.forced_passes = 0
         self.total_deferred_seconds = 0.0
@@ -73,17 +79,34 @@ class BackgroundWorkloadGate:
 
     @asynccontextmanager
     async def warmer_slot(self) -> AsyncIterator[None]:
-        """Serialize bounded proactive warmer units across warmer families."""
+        """Serialize and admit one complete bounded proactive warmer unit.
+
+        When unit admission is enabled, a unit may call ``wait_until_available``
+        at internal phase boundaries without restarting the interactive deferral
+        clock. The next unit still rechecks admission when it takes the slot.
+        """
         async with self._warmer_slot:
             await self.wait_until_available()
-            yield
+            if not self._unit_admission_enabled:
+                yield
+                return
+            admitted = _admitted_gates.get()
+            token = _admitted_gates.set(admitted | {id(self)})
+            try:
+                yield
+            finally:
+                _admitted_gates.reset(token)
 
     async def run_warmer_unit[T](self, operation: Callable[[], Awaitable[T]]) -> T:
-        await self.wait_until_available()
+        if not self._unit_admission_enabled:
+            await self.wait_until_available()
         async with self.warmer_slot():
             return await operation()
 
     async def wait_until_available(self) -> None:
+        if self._unit_admission_enabled and id(self) in _admitted_gates.get():
+            return
+
         started = monotonic()
         deferred = False
         forced = False

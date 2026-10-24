@@ -106,9 +106,14 @@ logger = logging.getLogger(__name__)
 
 @singleton
 def get_background_workload_gate() -> "BackgroundWorkloadGate":
+    from core.config import get_settings
     from services.native.background_workload_gate import BackgroundWorkloadGate
 
-    return BackgroundWorkloadGate()
+    return BackgroundWorkloadGate(
+        unit_admission_enabled=(
+            get_settings().background_workload_unit_admission_enabled
+        )
+    )
 
 
 @singleton

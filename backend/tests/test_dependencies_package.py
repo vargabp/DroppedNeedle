@@ -1,6 +1,7 @@
 """Tests for the dependencies package structure and registry."""
 
 import importlib
+from types import SimpleNamespace
 
 import pytest
 
@@ -90,6 +91,24 @@ class TestSingletonDecorator:
 
         # clean up: remove from registry
         _singleton_registry.remove(my_provider)
+
+
+class TestBackgroundWorkloadGateProvider:
+    def test_constructs_with_unit_admission_setting(self, monkeypatch):
+        from core import config
+        from core.dependencies import service_providers
+
+        monkeypatch.setattr(
+            config,
+            "get_settings",
+            lambda: SimpleNamespace(background_workload_unit_admission_enabled=True),
+        )
+        service_providers.get_background_workload_gate.cache_clear()
+        try:
+            gate = service_providers.get_background_workload_gate()
+            assert gate._unit_admission_enabled is True
+        finally:
+            service_providers.get_background_workload_gate.cache_clear()
 
 
 class TestDownloadServiceFreshness:

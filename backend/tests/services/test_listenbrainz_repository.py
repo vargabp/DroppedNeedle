@@ -14,6 +14,7 @@ from infrastructure.resilience.retry import CircuitOpenError, CircuitState
 from infrastructure.service_health import service_health
 from repositories.listenbrainz_repository import (
     ListenBrainzRepository,
+    _build_listenbrainz_rate_limiter,
     _listenbrainz_circuit_breaker,
     _listenbrainz_rate_limit_state,
     _listenbrainz_rate_limiter,
@@ -60,6 +61,15 @@ def _ok_response(json_data=None, headers=None):
 def test_baseline_limiter_is_evenly_paced_without_cold_burst():
     assert _listenbrainz_rate_limiter.rate == pytest.approx(2.5)
     assert _listenbrainz_rate_limiter.capacity == 1
+
+
+def test_environment_rate_override_keeps_capacity_one(monkeypatch):
+    monkeypatch.setenv("LISTENBRAINZ_RATE_LIMIT", "1.0")
+
+    limiter = _build_listenbrainz_rate_limiter()
+
+    assert limiter.rate == pytest.approx(1.0)
+    assert limiter.capacity == 1
 
 
 def test_dynamic_headers_reserve_budget_and_expire_cooldown():

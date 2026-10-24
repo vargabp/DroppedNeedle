@@ -27,9 +27,13 @@ def _isolated_factory():
     HttpClientFactory.reset_for_tests()
 
 
-def _settings(user_agent: str = "dropneedle/test") -> SimpleNamespace:
+def _settings(
+    user_agent: str = "dropneedle/test",
+    listenbrainz_user_agent: str | None = None,
+) -> SimpleNamespace:
     return SimpleNamespace(
         get_user_agent=lambda: user_agent,
+        get_listenbrainz_user_agent=lambda: listenbrainz_user_agent or user_agent,
         http_timeout=10.0,
         http_connect_timeout=5.0,
         http_max_connections=200,
@@ -127,7 +131,7 @@ def test_user_agent_identity_is_part_of_the_key():
 
 
 def test_named_clients_keep_distinct_policies():
-    settings = _settings()
+    settings = _settings(listenbrainz_user_agent="listenbrainz/specific")
     default_client = get_http_client(settings)
     listenbrainz_client = get_listenbrainz_http_client(settings)
     coverart_client = get_coverart_http_client(settings)
@@ -136,6 +140,8 @@ def test_named_clients_keep_distinct_policies():
     # ListenBrainz keeps its dedicated pool + HTTP/1.1 choice (http2 flag is
     # part of the key; the transport records the effective choice).
     assert listenbrainz_client is not default_client
+    assert default_client.headers["User-Agent"] == "dropneedle/test"
+    assert listenbrainz_client.headers["User-Agent"] == "listenbrainz/specific"
     assert getattr(listenbrainz_client, "_transport", None) is not None
     # Cover-art keeps its short budget regardless of construction order.
     assert coverart_client.timeout.read == 6.0

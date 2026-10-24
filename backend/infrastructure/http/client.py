@@ -250,6 +250,7 @@ def get_listenbrainz_http_client(
         max_keepalive=20,
         settings=settings,
         http2=False,
+        headers={"User-Agent": settings.get_listenbrainz_user_agent()},
     )
 
 

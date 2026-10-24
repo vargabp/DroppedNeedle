@@ -97,7 +97,56 @@ class TestLrclibDurationTolerance:
             )
 
 
-# D. load_from_file - type validation
+# D. Optional operational overrides
+
+class TestOperationalOverrides:
+    def test_defaults_preserve_published_behaviour(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for name in (
+            "BACKGROUND_WORKLOAD_UNIT_ADMISSION_ENABLED",
+            "LISTENBRAINZ_RATE_LIMIT",
+            "LISTENBRAINZ_USER_AGENT",
+        ):
+            monkeypatch.delenv(name, raising=False)
+
+        settings = _make_settings(_env_file=None)
+
+        assert settings.background_workload_unit_admission_enabled is False
+        assert settings.listenbrainz_rate_limit == pytest.approx(2.5)
+        assert settings.listenbrainz_user_agent == ""
+        assert settings.get_listenbrainz_user_agent() == settings.get_user_agent()
+
+    def test_environment_overrides_are_applied(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("BACKGROUND_WORKLOAD_UNIT_ADMISSION_ENABLED", "true")
+        monkeypatch.setenv("LISTENBRAINZ_RATE_LIMIT", "1.0")
+        monkeypatch.setenv(
+            "LISTENBRAINZ_USER_AGENT",
+            "ExampleMusic/1.0 ( https://example.invalid/contact )",
+        )
+
+        settings = _make_settings(_env_file=None)
+
+        assert settings.background_workload_unit_admission_enabled is True
+        assert settings.listenbrainz_rate_limit == pytest.approx(1.0)
+        assert settings.get_listenbrainz_user_agent() == (
+            "ExampleMusic/1.0 ( https://example.invalid/contact )"
+        )
+
+    @pytest.mark.parametrize("value", ["0", "-1", "1001", "nan", "inf"])
+    def test_invalid_listenbrainz_rate_is_rejected(self, value: str) -> None:
+        with pytest.raises(PydanticValidationError):
+            _make_settings(_env_file=None, listenbrainz_rate_limit=value)
+
+    @pytest.mark.parametrize("value", ["bad\rheader", "bad\nheader", "bad\x00header"])
+    def test_unsafe_listenbrainz_user_agent_is_rejected(self, value: str) -> None:
+        with pytest.raises(PydanticValidationError):
+            _make_settings(_env_file=None, listenbrainz_user_agent=value)
+
+
+# E. load_from_file - type validation
 
 class TestLoadFromFileTypeValidation:
     def test_wrong_type_raises_configuration_error(self, tmp_path: Path) -> None:
@@ -206,7 +255,7 @@ class TestLoadFromFileTypeValidation:
         assert settings.port == original_port
 
 
-# E. Log level application at startup
+# F. Log level application at startup
 
 class TestLogLevelApplication:
     def test_log_level_applied_to_root_logger(self) -> None:
@@ -232,7 +281,7 @@ class TestLogLevelApplication:
             root.setLevel(original)
 
 
-# F. get_settings() cache safety
+# G. get_settings() cache safety
 
 class TestGetSettingsCacheSafety:
     def test_failed_load_does_not_poison_cache(self, tmp_path: Path) -> None:
