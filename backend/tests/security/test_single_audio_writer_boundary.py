@@ -64,7 +64,9 @@ _FILESYSTEM_ALLOWLIST = {
     "services/home/genre_artwork_service.py",  # genre artwork cache maintenance
     "services/native/target_application_lifecycle.py",  # target application lifecycle cleanup
     "services/native/acquisition/strategy.py",  # acquisition payload staging (.part files)
+    "services/native/acquisition/plugin_strategy.py",  # plugin acquisition manifest staging before the import lane
     "services/native/precache/audiodb_phase.py",  # precache writes into the disposable cache
+    "services/compat/plugin_stream_service.py",  # plugin stream transcoding temp-file cleanup
     "api/v1/routes/import_drop.py",  # drop-upload staging into the disposable incoming dir
     "api/v1/routes/profile.py",  # avatar upload staging/removal
 }
