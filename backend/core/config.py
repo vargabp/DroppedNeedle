@@ -70,6 +70,27 @@ class Settings(BaseSettings):
         default=True,
         description="Proactively warm per-user Discover/Home in the background through the day (kill switch)."
     )
+    background_workload_unit_admission_enabled: bool = Field(
+        default=False,
+        description=(
+            "Keep one serialized background warmer unit admitted across its "
+            "internal workload-gate checks."
+        ),
+    )
+    listenbrainz_rate_limit: float = Field(
+        default=2.5,
+        gt=0.0,
+        le=1000.0,
+        description="Process-wide ListenBrainz request rate in requests per second.",
+    )
+    listenbrainz_user_agent: str = Field(
+        default="",
+        max_length=512,
+        description=(
+            "Optional ListenBrainz-specific User-Agent. Empty preserves the "
+            "existing generated application User-Agent."
+        ),
+    )
 
     lrclib_duration_tolerance_seconds: float = Field(
         default=2.0,
@@ -148,6 +169,14 @@ class Settings(BaseSettings):
     def validate_base_path(cls, v: str) -> str:
         return normalize_base_path(v)
 
+    @field_validator("listenbrainz_user_agent")
+    @classmethod
+    def validate_listenbrainz_user_agent(cls, v: str) -> str:
+        normalized = v.strip()
+        if any(character in normalized for character in ("\r", "\n", "\x00")):
+            raise ValueError("listenbrainz_user_agent must not contain control characters")
+        return normalized
+
     @model_validator(mode='after')
     def validate_config(self) -> Self:
         if self.cache_dir == Path("/app/cache"):
@@ -170,6 +199,19 @@ class Settings(BaseSettings):
                 f"at least 2x http_max_keepalive ({self.http_max_keepalive})"
             )
 
+        if not 0.0 < self.listenbrainz_rate_limit <= 1000.0:
+            errors.append(
+                "listenbrainz_rate_limit must be greater than 0 and at most 1000"
+            )
+        if any(
+            character in self.listenbrainz_user_agent
+            for character in ("\r", "\n", "\x00")
+        ):
+            errors.append(
+                "listenbrainz_user_agent must not contain control characters"
+            )
+        self.listenbrainz_user_agent = self.listenbrainz_user_agent.strip()
+
         for warning in warnings:
             logger.warning(warning)
 
@@ -185,6 +227,9 @@ class Settings(BaseSettings):
         id_part = self.instance_id[:8] if self.instance_id else "unknown"
         email = (self.contact_email or "").strip() or "contact@droppedneedle.com"
         return f"DroppedNeedleApp/{version} ({id_part}; {email}; https://www.droppedneedle.com)"
+
+    def get_listenbrainz_user_agent(self) -> str:
+        return self.listenbrainz_user_agent or self.get_user_agent()
 
     def load_from_file(self) -> None:
         if not self.config_file_path.exists():
@@ -230,6 +275,12 @@ class Settings(BaseSettings):
                     validated_values['log_level'] = type(self).validate_log_level(
                         validated_values['log_level']
                     )
+                if 'listenbrainz_user_agent' in validated_values:
+                    validated_values['listenbrainz_user_agent'] = (
+                        type(self).validate_listenbrainz_user_agent(
+                            validated_values['listenbrainz_user_agent']
+                        )
+                    )
             except ValueError as e:
                 raise ConfigurationError(f"Config file validation error: {e}")
 
@@ -258,6 +309,12 @@ class Settings(BaseSettings):
         url = _get('jellyfin_url')
         if url and not str(url).startswith(('http://', 'https://')):
             errors.append("jellyfin_url must start with http:// or https://")
+
+        listenbrainz_rate_limit = float(_get('listenbrainz_rate_limit'))
+        if not 0.0 < listenbrainz_rate_limit <= 1000.0:
+            errors.append(
+                "listenbrainz_rate_limit must be greater than 0 and at most 1000"
+            )
 
         if errors:
             raise ConfigurationError(

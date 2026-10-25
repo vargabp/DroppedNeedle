@@ -8,6 +8,7 @@ from typing import Any, Awaitable, Callable
 import httpx
 
 import msgspec
+from core.config import Settings
 from core.exceptions import (
     ExternalServiceError,
     RateLimitedError,
@@ -469,10 +470,18 @@ _listenbrainz_circuit_breaker = CircuitBreaker(
     ),
 )
 
-# Live edge evidence (2026-08-26): 30 requests/10 seconds. LB's API docs
-# (https://listenbrainz.readthedocs.io/en/latest/users/api/#rate-limiting) make
-# X-RateLimit-* dynamic, so keep the local baseline evenly paced with no burst.
-_listenbrainz_rate_limiter = TokenBucketRateLimiter(rate=2.5, capacity=1)
+def _build_listenbrainz_rate_limiter() -> TokenBucketRateLimiter:
+    """Build the process-global limiter from the optional environment override."""
+    return TokenBucketRateLimiter(
+        rate=Settings().listenbrainz_rate_limit,
+        capacity=1,
+    )
+
+
+# Preserve the published 2.5 requests/second baseline unless an operator supplies
+# LISTENBRAINZ_RATE_LIMIT (for example, 1.0 for the documented public ceiling).
+# Capacity remains one so neither path permits a cold burst.
+_listenbrainz_rate_limiter = _build_listenbrainz_rate_limiter()
 _metadata_deduplicator = RequestDeduplicator()
 
 LISTENBRAINZ_API_URL = "https://api.listenbrainz.org"

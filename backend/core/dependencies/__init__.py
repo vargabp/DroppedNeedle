@@ -120,6 +120,7 @@ from .service_providers import (  # noqa: F401
     get_target_library_policy_service,
     get_legacy_catalog_importer,
     get_target_library_scan_coordinator,
+    get_library_scan_wakeup,
     get_library_filesystem_coordinator,
     get_background_workload_gate,
     get_target_library_scan_scheduler,
