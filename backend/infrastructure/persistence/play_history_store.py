@@ -1,7 +1,9 @@
 import logging
 import sqlite3
 import threading
+import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import msgspec
@@ -9,6 +11,11 @@ import msgspec
 from infrastructure.persistence._database import PersistenceBase
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from infrastructure.persistence.scrobble_outbox_store import (
+        ListenBrainzOutboxEnqueueResult,
+    )
 
 
 class PlayHistoryRecord(msgspec.Struct, frozen=True):
@@ -110,6 +117,69 @@ class PlayHistoryStore(PersistenceBase):
 
         await self._write(operation)
         return row_id
+
+    async def insert_with_listenbrainz_outbox(
+        self,
+        user_id: str,
+        *,
+        delivery_key: str,
+        listened_at: int,
+        track_name: str,
+        artist_name: str,
+        played_at: str,
+        album_name: str | None = None,
+        recording_mbid: str | None = None,
+        release_group_mbid: str | None = None,
+        duration_ms: int | None = None,
+        source: str | None = None,
+    ) -> "ListenBrainzOutboxEnqueueResult":
+        """Atomically append legacy history and its ListenBrainz delivery intent."""
+        from infrastructure.persistence.scrobble_outbox_store import (
+            find_listenbrainz_delivery,
+            insert_pending_listenbrainz_delivery,
+        )
+
+        row_id = uuid4().hex
+        now = time.time()
+
+        def operation(conn: sqlite3.Connection) -> "ListenBrainzOutboxEnqueueResult":
+            existing = find_listenbrainz_delivery(conn, delivery_key)
+            if existing is not None:
+                return existing
+            conn.execute(
+                """
+                INSERT INTO play_history (
+                    id, user_id, track_name, artist_name, album_name,
+                    recording_mbid, release_group_mbid, duration_ms, source, played_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row_id,
+                    user_id,
+                    track_name,
+                    artist_name,
+                    album_name,
+                    recording_mbid,
+                    release_group_mbid,
+                    duration_ms,
+                    source,
+                    played_at,
+                ),
+            )
+            return insert_pending_listenbrainz_delivery(
+                conn,
+                play_history_id=row_id,
+                delivery_key=delivery_key,
+                user_id=user_id,
+                artist_name=artist_name,
+                track_name=track_name,
+                listened_at=listened_at,
+                album_name=album_name or "",
+                duration_ms=duration_ms or 0,
+                now=now,
+            )
+
+        return await self._write(operation)
 
     async def recent(self, user_id: str, limit: int = 50) -> list[PlayHistoryRecord]:
         safe_limit = max(1, limit)

@@ -1327,6 +1327,7 @@ export type ScrobbleSubmission = {
 export type ServiceResult = {
 	success: boolean;
 	error?: string;
+	status?: 'delivered' | 'pending' | 'failed';
 };
 
 export type ScrobbleResponse = {

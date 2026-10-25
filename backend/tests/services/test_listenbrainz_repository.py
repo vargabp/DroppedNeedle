@@ -13,6 +13,8 @@ from infrastructure.degradation import (
 from infrastructure.resilience.retry import CircuitOpenError, CircuitState
 from infrastructure.service_health import service_health
 from repositories.listenbrainz_repository import (
+    LISTENBRAINZ_PRIORITY_INTERACTIVE,
+    LISTENBRAINZ_PRIORITY_SCROBBLE,
     ListenBrainzRepository,
     _build_listenbrainz_rate_limiter,
     _listenbrainz_circuit_breaker,
@@ -59,7 +61,7 @@ def _ok_response(json_data=None, headers=None):
 
 
 def test_baseline_limiter_is_evenly_paced_without_cold_burst():
-    assert _listenbrainz_rate_limiter.rate == pytest.approx(2.5)
+    assert _listenbrainz_rate_limiter.rate == pytest.approx(1.0)
     assert _listenbrainz_rate_limiter.capacity == 1
 
 
@@ -407,6 +409,37 @@ async def test_username_validation_uses_shared_request_funnel(monkeypatch):
     assert "/1/user/alice/listen-count" in http_client.request.call_args.args[1]
 
 
+@pytest.mark.asyncio
+async def test_token_validation_uses_interactive_priority(monkeypatch):
+    limiter = AsyncMock()
+    monkeypatch.setattr(_listenbrainz_rate_limiter, "acquire", limiter)
+    repo, http_client = _make_repo()
+    http_client.request = AsyncMock(
+        return_value=_ok_response({"valid": True, "user_name": "alice"})
+    )
+
+    assert await repo.validate_token() == (True, "Successfully connected as 'alice'")
+    limiter.assert_awaited_once_with(priority=LISTENBRAINZ_PRIORITY_INTERACTIVE)
+
+
+@pytest.mark.asyncio
+async def test_priority_request_waits_for_short_shared_cooldown(monkeypatch):
+    limiter = AsyncMock()
+    sleep = AsyncMock()
+    monkeypatch.setattr(_listenbrainz_rate_limiter, "acquire", limiter)
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    admission = MagicMock(side_effect=[1.25, None])
+    monkeypatch.setattr(_listenbrainz_rate_limit_state, "admission_delay", admission)
+    repo, http_client = _make_repo()
+    http_client.request = AsyncMock(
+        return_value=_ok_response({"valid": True, "user_name": "alice"})
+    )
+
+    assert (await repo.validate_token())[0] is True
+    sleep.assert_awaited_once_with(1.25)
+    assert http_client.request.await_count == 1
+
+
 @pytest.mark.parametrize(
     ("validator", "args"),
     [("validate_username", ("alice",)), ("validate_token", ())],
@@ -644,6 +677,17 @@ class TestSubmitNowPlaying:
 
 
 class TestSubmitSingleListen:
+    @pytest.mark.asyncio
+    async def test_uses_scrobble_priority(self, monkeypatch):
+        limiter = AsyncMock()
+        monkeypatch.setattr(_listenbrainz_rate_limiter, "acquire", limiter)
+        repo, http_client = _make_repo()
+        http_client.request = AsyncMock(return_value=_ok_response())
+
+        await repo.submit_single_listen("Artist", "Track", 1700000000)
+
+        limiter.assert_awaited_once_with(priority=LISTENBRAINZ_PRIORITY_SCROBBLE)
+
     @pytest.mark.asyncio
     async def test_posts_single_listen_payload(self):
         repo, http_client = _make_repo()

@@ -63,6 +63,7 @@ from .repo_providers import (  # noqa: F401
     get_preview_repository,
     get_discovery_batch_store,
     get_play_history_store,
+    get_scrobble_outbox_store,
     get_follow_store,
     get_github_repository,
     get_download_store,

@@ -16,9 +16,14 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path, PurePosixPath
 import threading
 import time
-from typing import Any, NamedTuple, TypeVar
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
 import msgspec
+
+if TYPE_CHECKING:
+    from infrastructure.persistence.scrobble_outbox_store import (
+        ListenBrainzOutboxEnqueueResult,
+    )
 
 from core.exceptions import (
     ConfigurationError,
@@ -4943,8 +4948,23 @@ class NativeLibraryStore(PersistenceBase):
         album_name: str | None,
         duration_ms: int | None,
         source: str | None,
-    ) -> None:
-        def operation(connection: sqlite3.Connection) -> None:
+        delivery_key: str | None = None,
+        listened_at: int | None = None,
+    ) -> "ListenBrainzOutboxEnqueueResult | None":
+        from infrastructure.persistence.scrobble_outbox_store import (
+            find_listenbrainz_delivery,
+            insert_pending_listenbrainz_delivery,
+        )
+
+        now = time.time()
+
+        def operation(
+            connection: sqlite3.Connection,
+        ) -> "ListenBrainzOutboxEnqueueResult | None":
+            if delivery_key is not None:
+                existing = find_listenbrainz_delivery(connection, delivery_key)
+                if existing is not None:
+                    return existing
             resolved = (
                 self._resolve_target_id(connection, kind="track", identifier=track_id)
                 if track_id
@@ -4991,8 +5011,27 @@ class NativeLibraryStore(PersistenceBase):
                 ),
             )
 
-        await self._write(operation)
-        await self._invalidate()
+            if delivery_key is None:
+                return None
+            if listened_at is None:
+                raise ValueError("listened_at is required for ListenBrainz delivery")
+            return insert_pending_listenbrainz_delivery(
+                connection,
+                play_history_id=history_id,
+                delivery_key=delivery_key,
+                user_id=user_id,
+                artist_name=artist_name,
+                track_name=track_name,
+                listened_at=listened_at,
+                album_name=album_name or "",
+                duration_ms=duration_ms or 0,
+                now=now,
+            )
+
+        result = await self._write(operation)
+        if result is None or result.created:
+            await self._invalidate()
+        return result
 
     async def target_play_history_stats(
         self,

@@ -78,7 +78,7 @@ class Settings(BaseSettings):
         ),
     )
     listenbrainz_rate_limit: float = Field(
-        default=2.5,
+        default=1.0,
         gt=0.0,
         le=1000.0,
         description="Process-wide ListenBrainz request rate in requests per second.",

@@ -113,7 +113,7 @@ class TestOperationalOverrides:
         settings = _make_settings(_env_file=None)
 
         assert settings.background_workload_unit_admission_enabled is False
-        assert settings.listenbrainz_rate_limit == pytest.approx(2.5)
+        assert settings.listenbrainz_rate_limit == pytest.approx(1.0)
         assert settings.listenbrainz_user_agent == ""
         assert settings.get_listenbrainz_user_agent() == settings.get_user_agent()
 

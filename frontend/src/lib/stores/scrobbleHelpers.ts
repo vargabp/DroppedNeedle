@@ -46,7 +46,10 @@ export function shouldScrobble(
 
 export function formatServiceTooltip(
 	scrobbleStatus: string,
-	serviceDetail: Record<string, { success: boolean }> | null
+	serviceDetail: Record<
+		string,
+		{ success: boolean; status?: 'delivered' | 'pending' | 'failed' }
+	> | null
 ): string {
 	if (scrobbleStatus === 'tracking') return 'Tracking';
 	if (!serviceDetail || Object.keys(serviceDetail).length === 0) {
@@ -56,10 +59,14 @@ export function formatServiceTooltip(
 		.filter(([, v]) => v.success)
 		.map(([k]) => (k === 'lastfm' ? 'Last.fm' : k === 'listenbrainz' ? 'ListenBrainz' : k));
 	const failed = Object.entries(serviceDetail)
-		.filter(([, v]) => !v.success)
+		.filter(([, v]) => !v.success && v.status !== 'pending')
+		.map(([k]) => (k === 'lastfm' ? 'Last.fm' : k === 'listenbrainz' ? 'ListenBrainz' : k));
+	const pending = Object.entries(serviceDetail)
+		.filter(([, v]) => v.status === 'pending')
 		.map(([k]) => (k === 'lastfm' ? 'Last.fm' : k === 'listenbrainz' ? 'ListenBrainz' : k));
 	const parts: string[] = [];
 	if (succeeded.length) parts.push(`Scrobbled to ${succeeded.join(', ')}`);
+	if (pending.length) parts.push(`Pending retry: ${pending.join(', ')}`);
 	if (failed.length) parts.push(`Failed: ${failed.join(', ')}`);
 	return parts.join(' · ') || 'Scrobbled';
 }

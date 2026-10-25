@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import time
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from infrastructure.persistence.compat_bookmark_store import CompatBookmark
@@ -19,6 +19,11 @@ from repositories.playlist_repository import (
     _UNSET,
 )
 from services.native.target_catalog_writer_service import TargetCatalogWriterService
+
+if TYPE_CHECKING:
+    from infrastructure.persistence.scrobble_outbox_store import (
+        ListenBrainzOutboxEnqueueResult,
+    )
 
 
 class TargetDiscoveryBatchLibraryService:
@@ -416,6 +421,44 @@ class TargetPlayHistoryStore:
             source=source,
         )
         return history_id
+
+    async def insert_with_listenbrainz_outbox(
+        self,
+        user_id: str,
+        *,
+        delivery_key: str,
+        listened_at: int,
+        track_name: str,
+        artist_name: str,
+        played_at: str,
+        album_name: str | None = None,
+        recording_mbid: str | None = None,
+        release_group_mbid: str | None = None,
+        duration_ms: int | None = None,
+        source: str | None = None,
+    ) -> "ListenBrainzOutboxEnqueueResult":
+        """Atomically append target history and its ListenBrainz delivery intent."""
+        track_id = await self._store.resolve_target_track_for_history(
+            recording_mbid=recording_mbid,
+            album_identifier=release_group_mbid,
+            track_name=track_name,
+            artist_name=artist_name,
+        )
+        result = await self._store.insert_target_play_history(
+            history_id=uuid4().hex,
+            user_id=user_id,
+            track_id=track_id,
+            track_name=track_name,
+            artist_name=artist_name,
+            played_at=played_at,
+            album_name=album_name,
+            duration_ms=duration_ms,
+            source=source,
+            delivery_key=delivery_key,
+            listened_at=listened_at,
+        )
+        assert result is not None
+        return result
 
     async def compat_stats(
         self,
