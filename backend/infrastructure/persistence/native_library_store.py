@@ -20,6 +20,8 @@ from typing import Any, NamedTuple, TypeVar
 
 import msgspec
 
+from infrastructure.persistence.import_cohort_binding import ImportCohortCommitCandidate
+
 from core.exceptions import (
     ConfigurationError,
     ConflictError,
@@ -847,7 +849,14 @@ class NativeLibraryStore(PersistenceBase):
         invalidator: Callable[[], Awaitable[None]] | None = None,
         scan_invalidator: Callable[[], Awaitable[None]] | None = None,
         work_wakeups: DurableWorkWakeups | None = None,
+        *,
+        _cohort_schema_candidate_enabled: bool = False,
+        _cohort_policy_invalidation_enabled: bool = False,
+        _cohort_policy_transition_enabled: bool = False,
     ) -> None:
+        self._cohort_schema_candidate_enabled = _cohort_schema_candidate_enabled
+        self._cohort_policy_invalidation_enabled = _cohort_policy_invalidation_enabled
+        self._cohort_policy_transition_enabled = _cohort_policy_transition_enabled
         self._invalidator = invalidator
         self._scan_invalidator = scan_invalidator or invalidator
         self._scan_invalidation_lock = asyncio.Lock()
@@ -867,6 +876,16 @@ class NativeLibraryStore(PersistenceBase):
         self._browse_key_locks: dict[tuple, asyncio.Lock] = {}
         self._browse_touch_counter = 0
         super().__init__(db_path, write_lock)
+
+    async def _invalidate_cohort_policy_candidate(self, seal, *, invalidated_at):
+        if not self._cohort_policy_invalidation_enabled:
+            raise ValueError('Private cohort policy invalidation is disabled.')
+        from infrastructure.persistence.import_cohort_binding import invalidate_cohort_policy_candidate
+        def operation(connection):
+            if not connection.in_transaction:
+                connection.execute('BEGIN IMMEDIATE')
+            return invalidate_cohort_policy_candidate(connection, seal, invalidated_at=invalidated_at)
+        return await self._write(operation)
 
     async def _write(self, operation: Callable[[sqlite3.Connection], _T]) -> _T:
         def tracked(connection: sqlite3.Connection) -> tuple[_T, bool]:
@@ -2134,6 +2153,11 @@ class NativeLibraryStore(PersistenceBase):
                     "Repaired legacy synthetic artist identities",
                     extra=artist_repairs,
                 )
+            if self._cohort_schema_candidate_enabled:
+                from infrastructure.persistence.import_cohort_binding import install_cohort_schema_candidate
+                if not connection.in_transaction:
+                    connection.execute('BEGIN IMMEDIATE')
+                install_cohort_schema_candidate(connection)
             self._ensure_foreign_key_validation_triggers(connection)
             connection.commit()
         finally:
@@ -8090,16 +8114,35 @@ class NativeLibraryStore(PersistenceBase):
         queue_cursor: str | None = None,
         background: bool = False,
         resurrect_attention: bool = True,
+        _cohort_completion_candidate: Any = None,
+        _cohort_paged_completion_candidate: Any = None,
+        _cohort_context_revision: int | None = None,
     ) -> list[tuple[str, bool]]:
         """Enqueue one bounded job batch in a single store-owned transaction."""
 
         def operation(connection: sqlite3.Connection) -> list[tuple[str, bool]]:
+            if _cohort_paged_completion_candidate is not None:
+                from infrastructure.persistence.import_cohort_paging import prepare_paged_completion, validate_paged_completion
+                if _cohort_completion_candidate is not None:
+                    raise ValueError('Only one private completion mode is permitted.')
+                if not connection.in_transaction:
+                    connection.execute('BEGIN IMMEDIATE')
+                before_paged = prepare_paged_completion(connection, _cohort_paged_completion_candidate,
+                    jobs, scan_run_id, grouping_context, queue_cursor, _cohort_context_revision)
+            if _cohort_completion_candidate is not None:
+                from infrastructure.persistence.import_cohort_completion import require_completion_candidate
+                if not connection.in_transaction:
+                    connection.execute('BEGIN IMMEDIATE')
+                require_completion_candidate(connection, _cohort_completion_candidate, jobs,
+                                             scan_run_id, grouping_context, queue_cursor)
             results = [
                 self._enqueue_identification_job_result(
                     connection, job, resurrect_attention=resurrect_attention
                 )
                 for job in jobs
             ]
+            if (_cohort_completion_candidate is not None or _cohort_paged_completion_candidate is not None) and not all(job_id for job_id, _created in results):
+                raise StaleRevisionError('Native identification admission refused cohort completion.')
             created = sum(created for _, created in results)
             if scan_run_id is not None and created:
                 updated = connection.execute(
@@ -8130,6 +8173,30 @@ class NativeLibraryStore(PersistenceBase):
                     raise StaleRevisionError(
                         "The grouping context is no longer pending."
                     )
+            if _cohort_completion_candidate is not None:
+                from infrastructure.persistence.import_cohort_scan import require_current_cohort
+                root_id, relative_directory = grouping_context
+                completed = connection.execute("UPDATE library_scan_grouping_contexts SET state='completed',"
+                    "staging_state='completed',row_revision=row_revision+1 WHERE run_id=? AND root_id=? "
+                    "AND relative_directory=? AND state='pending' AND staging_state='pending'",
+                    (scan_run_id, root_id, relative_directory))
+                if completed.rowcount != 1:
+                    raise StaleRevisionError('Cohort completion context changed.')
+                require_current_cohort(connection, _cohort_completion_candidate)
+                queued = connection.execute('SELECT local_album_id,local_track_id,kind,input_revision,dedupe_key '
+                    'FROM library_identification_jobs WHERE id=?', (results[0][0],)).fetchone()
+                if queued is None or any(queued[field] != getattr(jobs[0], field) for field in (
+                    'local_album_id', 'local_track_id', 'kind', 'input_revision', 'dedupe_key')):
+                    raise StaleRevisionError('Native queued identification changed during cohort completion.')
+            if _cohort_paged_completion_candidate is not None:
+                root_id, relative_directory = grouping_context
+                completed = connection.execute("UPDATE library_scan_grouping_contexts SET state='completed',"
+                    "staging_state='completed',row_revision=row_revision+1 WHERE run_id=? AND root_id=? "
+                    "AND relative_directory=? AND state='pending' AND staging_state='queue'",
+                    (scan_run_id, root_id, relative_directory))
+                if completed.rowcount != 1:
+                    raise StaleRevisionError('Paged cohort completion context changed.')
+                validate_paged_completion(connection, _cohort_paged_completion_candidate, jobs, scan_run_id, before_paged, results)
             return results
 
         if background:
@@ -12528,6 +12595,8 @@ class NativeLibraryStore(PersistenceBase):
         failures: list[ScanFailureRecord],
         increments: dict[str, int],
         updated_at: float,
+        _cohort_scan_candidate: Any = None,
+        _cohort_inventory_candidate: Any = None,
     ) -> ScanRun:
         """Commit catalog, inventory, counters, heartbeat, and stream atomically.
 
@@ -12536,8 +12605,24 @@ class NativeLibraryStore(PersistenceBase):
         failure-table row in this one transaction."""
 
         def operation(connection: sqlite3.Connection) -> ScanRun:
+            admitted_writes = writes
+            if _cohort_inventory_candidate is not None and _cohort_scan_candidate is None:
+                raise ValidationError('Cohort inventory requires complete byte admission.')
+            if _cohort_scan_candidate is not None:
+                from infrastructure.persistence.import_cohort_scan import prepare_scan_writes
+                # Native scan writes normally start SQLite's deferred transaction
+                # at their first mutation. Candidate admission reads must already
+                # share the exact write snapshot/fence, before any catalog edit.
+                if not connection.in_transaction:
+                    connection.execute('BEGIN IMMEDIATE')
+                if _cohort_inventory_candidate is not None:
+                    from infrastructure.persistence.import_cohort_scan import require_cohort_inventory, cohort_inventory_increments
+                    require_cohort_inventory(connection, _cohort_scan_candidate, _cohort_inventory_candidate, run_id)
+                    if states or failures or increments != cohort_inventory_increments(_cohort_inventory_candidate):
+                        raise ValidationError('Exact native cohort inventory counters and writes required.')
+                admitted_writes = prepare_scan_writes(connection, _cohort_scan_candidate, writes)
             catalog_changed = False
-            for write in writes:
+            for write in admitted_writes:
                 track_id, changed = self._upsert_scanned_track_tx(
                     connection, write, scan_run_id=run_id
                 )
@@ -12628,6 +12713,11 @@ class NativeLibraryStore(PersistenceBase):
                     "A scan run revision reached its maximum value."
                 )
             self._bump_stream(connection, "scan")
+            if _cohort_scan_candidate is not None:
+                from infrastructure.persistence.import_cohort_scan import require_current_cohort
+                require_current_cohort(connection, _cohort_scan_candidate)
+                if _cohort_inventory_candidate is not None:
+                    require_cohort_inventory(connection, _cohort_scan_candidate, _cohort_inventory_candidate, run_id, post=True)
             return self._scan_state_from_row(updated)
 
         return await self._write_scan(operation)
@@ -13106,8 +13196,18 @@ class NativeLibraryStore(PersistenceBase):
         *,
         next_cursor: str | None,
         exhausted: bool,
+        _cohort_paged_candidate: Any = None,
+        _cohort_page_limit: int | None = None,
+        _cohort_context_revision: int | None = None,
     ) -> None:
         def operation(connection: sqlite3.Connection) -> None:
+            expected_stage = None
+            if _cohort_paged_candidate is not None:
+                from infrastructure.persistence.import_cohort_paging import prepare_paged_track_write, validate_paged_track_state
+                if not connection.in_transaction:
+                    connection.execute('BEGIN IMMEDIATE')
+                expected_stage = prepare_paged_track_write(connection, _cohort_paged_candidate, run_id,
+                    root_id, relative_directory, evidence, next_cursor, exhausted, _cohort_page_limit, _cohort_context_revision)
             context = connection.execute(
                 "SELECT state,staging_state FROM library_scan_grouping_contexts "
                 "WHERE run_id=? AND root_id=? AND relative_directory=?",
@@ -13154,6 +13254,11 @@ class NativeLibraryStore(PersistenceBase):
                 ),
             )
 
+            if _cohort_paged_candidate is not None:
+                staged, _, _ = validate_paged_track_state(connection, _cohort_paged_candidate, run_id)
+                if (staged['staging_state'], staged['staging_cursor'], staged['row_revision']) != expected_stage:
+                    raise StaleRevisionError('Native cohort page staging state changed during write.')
+
         await super()._background_write(operation)
 
     async def prepare_staged_grouping_tokens(
@@ -13163,6 +13268,8 @@ class NativeLibraryStore(PersistenceBase):
         relative_directory: str,
         *,
         limit: int,
+        _cohort_token_candidate: Any = None,
+        _cohort_context_revision: int | None = None,
     ) -> bool:
         parameters = (run_id, root_id, relative_directory)
 
@@ -13276,6 +13383,19 @@ class NativeLibraryStore(PersistenceBase):
         merge_target = await self._read(inspect_merge_target)
 
         def operation(connection: sqlite3.Connection) -> int:
+            expected_token_state = None
+            if _cohort_token_candidate is not None:
+                from infrastructure.persistence.import_cohort_paging import prepare_token_write, validate_token_state
+                if not connection.in_transaction:
+                    connection.execute('BEGIN IMMEDIATE')
+                expected_token_state = prepare_token_write(connection, _cohort_token_candidate, run_id,
+                    root_id, relative_directory, limit, _cohort_context_revision)
+            def validate_after():
+                if _cohort_token_candidate is not None:
+                    current, _, _, _ = validate_token_state(connection, _cohort_token_candidate, run_id)
+                    actual = tuple(current[key] for key in ('staging_state', 'staging_cursor', 'grouping_merge_target', 'grouping_merge_ready', 'row_revision'))
+                    if actual != expected_token_state:
+                        raise StaleRevisionError('Native token state changed during write.')
             context = connection.execute(
                 "SELECT staging_cursor,grouping_merge_target,grouping_merge_ready "
                 "FROM library_scan_grouping_contexts "
@@ -13317,6 +13437,7 @@ class NativeLibraryStore(PersistenceBase):
                     "AND root_id=? AND relative_directory=?",
                     parameters,
                 )
+                validate_after()
                 return 0
             # M-02 missing-row absorb (small-path untagged-merge parity):
             # a missing row joins the merged fold only when it is numbered,
@@ -13579,6 +13700,7 @@ class NativeLibraryStore(PersistenceBase):
                 "AND relative_directory=?",
                 (rows[-1]["local_track_id"], *parameters),
             )
+            validate_after()
             return len(rows)
 
         return await super()._background_write(operation) == 0
@@ -13590,8 +13712,22 @@ class NativeLibraryStore(PersistenceBase):
         relative_directory: str,
         *,
         limit: int,
+        _cohort_summary_candidate: Any = None,
+        _cohort_context_revision: int | None = None,
     ) -> bool:
         def operation(connection: sqlite3.Connection) -> bool:
+            expected_summary_state = None
+            if _cohort_summary_candidate is not None:
+                from infrastructure.persistence.import_cohort_paging import prepare_summary_write, validate_token_state
+                if not connection.in_transaction:
+                    connection.execute('BEGIN IMMEDIATE')
+                expected_summary_state = prepare_summary_write(connection, _cohort_summary_candidate, run_id,
+                    root_id, relative_directory, limit, _cohort_context_revision)
+            def validate_after():
+                if _cohort_summary_candidate is not None:
+                    current, _, _, _ = validate_token_state(connection, _cohort_summary_candidate, run_id, summary=True)
+                    if tuple(current[key] for key in ('staging_state', 'staging_cursor', 'row_revision')) != expected_summary_state:
+                        raise StaleRevisionError('Native summary state changed during write.')
             context = connection.execute(
                 "SELECT staging_cursor FROM library_scan_grouping_contexts "
                 "WHERE run_id=? AND root_id=? AND relative_directory=? "
@@ -13647,6 +13783,7 @@ class NativeLibraryStore(PersistenceBase):
                     "AND root_id=? AND relative_directory=?",
                     (run_id, root_id, relative_directory),
                 )
+                validate_after()
                 return True
             token_values = [str(row["grouping_token"]) for row in tokens]
             fallback_title = (
@@ -13719,6 +13856,7 @@ class NativeLibraryStore(PersistenceBase):
                 "AND relative_directory=?",
                 (token_values[-1], run_id, root_id, relative_directory),
             )
+            validate_after()
             return False
 
         return await super()._background_write(operation)
@@ -13746,8 +13884,18 @@ class NativeLibraryStore(PersistenceBase):
         relative_directory: str,
         *,
         limit: int,
+        _cohort_continuity_candidate: Any = None,
+        _cohort_context_revision: int | None = None,
     ) -> int:
         def operation(connection: sqlite3.Connection) -> int:
+            expected_continuity = None
+            expected_count = None
+            if _cohort_continuity_candidate is not None:
+                from infrastructure.persistence.import_cohort_paging import prepare_continuity_write, validate_continuity_write
+                if not connection.in_transaction:
+                    connection.execute('BEGIN IMMEDIATE')
+                expected_continuity, expected_count = prepare_continuity_write(connection, _cohort_continuity_candidate,
+                    run_id, root_id, relative_directory, _cohort_context_revision, limit=limit)
             rows = connection.execute(
                 "SELECT edge.old_album_id,edge.grouping_token FROM "
                 "library_scan_grouping_edges edge JOIN library_scan_grouping_old_nodes "
@@ -13790,6 +13938,10 @@ class NativeLibraryStore(PersistenceBase):
                         row["grouping_token"],
                     ),
                 )
+            if _cohort_continuity_candidate is not None:
+                validate_continuity_write(connection, _cohort_continuity_candidate, run_id, expected_continuity)
+                if len(rows) != expected_count:
+                    raise StaleRevisionError('Native isolated continuity count changed.')
             return len(rows)
 
         return await super()._background_write(operation)
@@ -14085,15 +14237,27 @@ class NativeLibraryStore(PersistenceBase):
         await super()._background_write(operation)
 
     async def finish_grouping_continuity(
-        self, run_id: str, root_id: str, relative_directory: str
+        self, run_id: str, root_id: str, relative_directory: str, *,
+        _cohort_continuity_candidate: Any = None,
+        _cohort_context_revision: int | None = None,
     ) -> None:
         def operation(connection: sqlite3.Connection) -> None:
+            expected_continuity = None
+            if _cohort_continuity_candidate is not None:
+                from infrastructure.persistence.import_cohort_paging import prepare_continuity_write, validate_continuity_write
+                if not connection.in_transaction:
+                    connection.execute('BEGIN IMMEDIATE')
+                expected_continuity, _ = prepare_continuity_write(connection, _cohort_continuity_candidate,
+                    run_id, root_id, relative_directory, _cohort_context_revision, finish=True)
             connection.execute(
                 "UPDATE library_scan_grouping_contexts SET staging_state='albums',"
                 "staging_cursor=NULL,row_revision=row_revision+1 WHERE run_id=? "
                 "AND root_id=? AND relative_directory=? AND state='pending'",
                 (run_id, root_id, relative_directory),
             )
+
+            if _cohort_continuity_candidate is not None:
+                validate_continuity_write(connection, _cohort_continuity_candidate, run_id, expected_continuity)
 
         await super()._background_write(operation)
 
@@ -14124,8 +14288,17 @@ class NativeLibraryStore(PersistenceBase):
         groups: list[dict[str, Any]],
         *,
         now: float,
+        _cohort_provision_candidate: Any = None,
+        _cohort_context_revision: int | None = None,
     ) -> None:
         def operation(connection: sqlite3.Connection) -> int:
+            before_provision = None
+            if _cohort_provision_candidate is not None:
+                from infrastructure.persistence.import_cohort_paging import prepare_provision_write, validate_provision_write
+                if not connection.in_transaction:
+                    connection.execute('BEGIN IMMEDIATE')
+                before_provision = prepare_provision_write(connection, _cohort_provision_candidate, run_id,
+                    root_id, relative_directory, _cohort_context_revision, groups)
             # F-MATCH-06 fail-closed guard (equivalent in effect to
             # apply_grouping_context's duplicate-target rejection): two distinct
             # staged groups must never target one new local album ID, and one
@@ -14241,26 +14414,39 @@ class NativeLibraryStore(PersistenceBase):
                         group["grouping_token"],
                     ),
                 )
-            if changed:
-                return self._bump_catalog(connection)
-            return int(
+            revision = self._bump_catalog(connection) if changed else int(
                 connection.execute(
                     "SELECT value FROM library_catalog_revision WHERE singleton=1"
                 ).fetchone()[0]
             )
+            if _cohort_provision_candidate is not None:
+                validate_provision_write(connection, _cohort_provision_candidate, run_id, before_provision, now)
+            return revision
 
         await self._write_scan(operation)
 
     async def finish_grouping_album_provisioning(
-        self, run_id: str, root_id: str, relative_directory: str
+        self, run_id: str, root_id: str, relative_directory: str, *,
+        _cohort_provision_candidate: Any = None,
+        _cohort_context_revision: int | None = None,
     ) -> None:
         def operation(connection: sqlite3.Connection) -> None:
+            before_provision = None
+            if _cohort_provision_candidate is not None:
+                from infrastructure.persistence.import_cohort_paging import prepare_provision_write, validate_provision_write
+                if not connection.in_transaction:
+                    connection.execute('BEGIN IMMEDIATE')
+                before_provision = prepare_provision_write(connection, _cohort_provision_candidate, run_id,
+                    root_id, relative_directory, _cohort_context_revision, [], finish=True)
             connection.execute(
                 "UPDATE library_scan_grouping_contexts SET staging_state='memberships',"
                 "application_cursor=NULL,row_revision=row_revision+1 WHERE run_id=? "
                 "AND root_id=? AND relative_directory=? AND state='pending'",
                 (run_id, root_id, relative_directory),
             )
+
+            if _cohort_provision_candidate is not None:
+                validate_provision_write(connection, _cohort_provision_candidate, run_id, before_provision, None)
 
         await super()._background_write(operation)
 
@@ -14271,8 +14457,15 @@ class NativeLibraryStore(PersistenceBase):
         relative_directory: str,
         *,
         limit: int,
+        _cohort_membership_candidate=None,
+        _cohort_context_revision=None,
     ) -> bool:
         def operation(connection: sqlite3.Connection) -> int:
+            if _cohort_membership_candidate is not None:
+                from infrastructure.persistence.import_cohort_paging import prepare_membership_write, validate_membership_write
+                connection.execute('BEGIN IMMEDIATE')
+                expected_membership = prepare_membership_write(connection, _cohort_membership_candidate,
+                    run_id, root_id, relative_directory, limit, _cohort_context_revision)
             context = connection.execute(
                 "SELECT application_cursor FROM library_scan_grouping_contexts "
                 "WHERE run_id=? AND root_id=? AND relative_directory=? "
@@ -14300,6 +14493,8 @@ class NativeLibraryStore(PersistenceBase):
                     "AND relative_directory=?",
                     (run_id, root_id, relative_directory),
                 )
+                if _cohort_membership_candidate is not None:
+                    validate_membership_write(connection, _cohort_membership_candidate, run_id, expected_membership, 0)
                 return 0
             changed = False
             for row in rows:
@@ -14323,6 +14518,8 @@ class NativeLibraryStore(PersistenceBase):
             )
             if changed:
                 self._bump_catalog(connection)
+            if _cohort_membership_candidate is not None:
+                validate_membership_write(connection, _cohort_membership_candidate, run_id, expected_membership, len(rows))
             return len(rows)
 
         return await self._write_scan(operation) == 0
@@ -14335,8 +14532,16 @@ class NativeLibraryStore(PersistenceBase):
         *,
         now: float,
         limit: int,
+        _cohort_retirement_candidate=None,
+        _cohort_context_revision=None,
     ) -> bool:
         def operation(connection: sqlite3.Connection) -> int:
+            if _cohort_retirement_candidate is not None:
+                from infrastructure.persistence.import_cohort_paging import prepare_retirement_write, validate_retirement_write
+                if not connection.in_transaction:
+                    connection.execute('BEGIN IMMEDIATE')
+                expected_retirement = prepare_retirement_write(connection, _cohort_retirement_candidate,
+                    run_id, root_id, relative_directory, limit, _cohort_context_revision)
             context = connection.execute(
                 "SELECT application_cursor FROM library_scan_grouping_contexts "
                 "WHERE run_id=? AND root_id=? AND relative_directory=? "
@@ -14360,6 +14565,8 @@ class NativeLibraryStore(PersistenceBase):
                     "AND relative_directory=?",
                     (run_id, root_id, relative_directory),
                 )
+                if _cohort_retirement_candidate is not None:
+                    validate_retirement_write(connection, _cohort_retirement_candidate, run_id, expected_retirement, 0)
                 return 0
             changed = False
             for row in albums:
@@ -14407,6 +14614,8 @@ class NativeLibraryStore(PersistenceBase):
             )
             if changed:
                 self._bump_catalog(connection)
+            if _cohort_retirement_candidate is not None:
+                validate_retirement_write(connection, _cohort_retirement_candidate, run_id, expected_retirement, len(albums))
             return len(albums)
 
         return await self._write_scan(operation) == 0
@@ -14508,6 +14717,7 @@ class NativeLibraryStore(PersistenceBase):
         applications: list[GroupingApplication],
         *,
         now: float,
+        _cohort_grouping_candidate: Any = None,
     ) -> tuple[list[str], int]:
         """Apply a full-directory proposal through bounded catalog transactions."""
         all_track_ids = [
@@ -14580,6 +14790,7 @@ class NativeLibraryStore(PersistenceBase):
                 target_id_set=target_id_set,
                 retirement_plan=retirement_plan,
                 now=now,
+                _cohort_grouping_candidate=_cohort_grouping_candidate,
             )
         return target_ids, revision
 
@@ -14609,8 +14820,41 @@ class NativeLibraryStore(PersistenceBase):
         target_id_set: set[str],
         retirement_plan: dict[str, str | None],
         now: float,
+        _cohort_grouping_candidate: Any = None,
     ) -> int:
         def operation(connection: sqlite3.Connection) -> int:
+            if _cohort_grouping_candidate is not None:
+                from infrastructure.persistence.import_cohort_scan import require_current_cohort
+                if not connection.in_transaction:
+                    connection.execute('BEGIN IMMEDIATE')
+                payload = require_current_cohort(connection, _cohort_grouping_candidate)
+                run = connection.execute('SELECT state,requested_control FROM library_scan_runs WHERE id=?', (run_id,)).fetchone()
+                stage = connection.execute('SELECT staging_state FROM library_scan_grouping_contexts '
+                    'WHERE run_id=? AND root_id=? AND relative_directory=?', (run_id, root_id, relative_directory)).fetchone()
+                if (run is None or run['state'] not in {'indexing', 'reconciling'}
+                        or run['requested_control'] != 'none' or stage is None or stage['staging_state'] != 'pending'):
+                    raise StaleRevisionError('Native small cohort grouping is not pending/running.')
+                expected = {member['track']['id'] for member in payload['members']}
+                actual = [track_id for app in applications for track_id in app.group.track_ids]
+                if (root_id != _cohort_grouping_candidate.root_id
+                        or relative_directory != _cohort_grouping_candidate.album_parent
+                        or len(applications) != 1 or len(actual) != len(expected) or set(actual) != expected
+                        or applications[0].local_album_id != payload['album_id']
+                        or applications[0].group.retained_album_id != payload['album_id']
+                        or applications[0].group.reason_code == 'MANUAL_MEMBERSHIP_RESTORED'):
+                    raise ValidationError('Exact complete native cohort grouping required.')
+                from services.native.local_album_grouper import normalize_group_value
+                raw = payload['members'][0]['track']
+                group = applications[0].group
+                artist_id = connection.execute('SELECT album_artist_id FROM local_albums WHERE id=?',
+                                               (payload['album_id'],)).fetchone()[0]
+                expected_key = (f"{root_id}:{relative_directory}:"
+                                f"{normalize_group_value(raw['tag_album_title'])}:"
+                                f"{normalize_group_value(raw['tag_album_artist_name'])}")
+                if (group.title != raw['tag_album_title'] or group.album_artist_name != raw['tag_album_artist_name']
+                        or group.grouping_key != expected_key or applications[0].local_artist_id != artist_id
+                        or group.reason_code != 'CONSISTENT_ALBUM_TAGS'):
+                    raise ValidationError('Cohort grouping proposal disagrees with native tags or artist.')
             context = connection.execute(
                 "SELECT state FROM library_scan_grouping_contexts WHERE run_id = ? "
                 "AND root_id = ? AND relative_directory = ?",
@@ -14785,7 +15029,10 @@ class NativeLibraryStore(PersistenceBase):
                         "VALUES (?,?,'merged_album',?)",
                         (old_album_id, successor, now),
                     )
-            return self._bump_catalog(connection)
+            revision = self._bump_catalog(connection)
+            if _cohort_grouping_candidate is not None:
+                require_current_cohort(connection, _cohort_grouping_candidate)
+            return revision
 
         return await self._write_scan(operation)
 
@@ -15243,9 +15490,27 @@ class NativeLibraryStore(PersistenceBase):
         return await self._read(operation)
 
     async def abort_policy_transition(
-        self, *, proposed_policy_revision: str, aborted_at: float
+        self, *, proposed_policy_revision: str, aborted_at: float,
+        _cohort_recovery_abort_seal=None,
     ) -> None:
         def operation(connection: sqlite3.Connection) -> None:
+            seal = _cohort_recovery_abort_seal
+            if seal is not None:
+                if not self._cohort_policy_transition_enabled or not self._cohort_policy_invalidation_enabled:
+                    raise ValueError('Private cohort recovery abort is disabled.')
+                if (type(seal) is not tuple or len(seal) != 2 or not all(type(value) is str for value in seal)
+                        or type(aborted_at) not in (int, float) or not math.isfinite(aborted_at) or aborted_at < 0):
+                    raise ValueError('Exact private recovery abort evidence required.')
+                if not connection.in_transaction:
+                    connection.execute('BEGIN IMMEDIATE')
+                row = connection.execute('SELECT * FROM library_policy_transitions WHERE singleton=1').fetchone()
+                durable = [value[0] for value in connection.execute('SELECT desired_policy_revision FROM library_policy_state')]
+                if (row is None or row['state'] != 'prepared' or row['previous_policy_revision'] != seal[0]
+                        or durable != [seal[0]] or hashlib.sha256(json.dumps(dict(row), sort_keys=True).encode()).hexdigest() != seal[1]):
+                    raise StaleRevisionError('Private recovery abort journal or durable boundary changed.')
+                expected = dict(row)
+                expected.update(state='aborted', completed_at=aborted_at)
+                before_changes = connection.total_changes
             changed = connection.execute(
                 "UPDATE library_policy_transitions SET state = 'aborted', completed_at = ? "
                 "WHERE singleton = 1 AND state = 'prepared' "
@@ -15256,13 +15521,32 @@ class NativeLibraryStore(PersistenceBase):
                 raise StaleRevisionError(
                     "The prepared library policy change is no longer current."
                 )
+            if seal is not None:
+                after = connection.execute('SELECT * FROM library_policy_transitions WHERE singleton=1').fetchone()
+                if after is None or dict(after) != expected or connection.total_changes != before_changes + 1:
+                    raise StaleRevisionError('Private recovery abort changed during write.')
 
         await self._write(operation)
 
     async def commit_policy_transition(
-        self, *, proposed_policy_revision: str, updated_at: float
+        self, *, proposed_policy_revision: str, updated_at: float,
+        _cohort_policy_transition_candidate=None,
     ) -> dict[str, int]:
         def operation(connection: sqlite3.Connection) -> dict[str, int]:
+            candidate = _cohort_policy_transition_candidate
+            if self._cohort_policy_transition_enabled and candidate is None:
+                raise ValueError('Private cohort transition seal required.')
+            if candidate is not None:
+                if not self._cohort_policy_transition_enabled or not self._cohort_policy_invalidation_enabled:
+                    raise ValueError('Private cohort policy transition is disabled.')
+                if type(updated_at) not in (int, float) or not math.isfinite(updated_at) or updated_at < 0:
+                    raise ValueError('Exact cohort transition clock required.')
+                if not connection.in_transaction:
+                    connection.execute('BEGIN IMMEDIATE')
+                from infrastructure.persistence.import_cohort_binding import require_cohort_policy_transition_candidate
+                require_cohort_policy_transition_candidate(connection, candidate)
+                if proposed_policy_revision != candidate.configured_policy_revision:
+                    raise ValueError('Cohort transition revision changed.')
             transition = connection.execute(
                 "SELECT proposed_policy_revision, scopes_json, state "
                 "FROM library_policy_transitions WHERE singleton = 1"
@@ -15284,11 +15568,26 @@ class NativeLibraryStore(PersistenceBase):
                 policy_revision=proposed_policy_revision,
                 updated_at=updated_at,
             )
+            if candidate is not None:
+                from infrastructure.persistence.import_cohort_binding import invalidate_cohort_policy_candidate
+                require_cohort_policy_transition_candidate(connection, candidate, boundary_committed=True)
+                transition_payload = json.loads(candidate.transition_json)
+                if transition_payload['previous_policy_revision'] != proposed_policy_revision:
+                    for binding in candidate.bindings:
+                        invalidate_cohort_policy_candidate(connection, binding, invalidated_at=updated_at)
+            before_completion_changes = connection.total_changes
             connection.execute(
                 "UPDATE library_policy_transitions SET state = 'completed', completed_at = ? "
                 "WHERE singleton = 1",
                 (updated_at,),
             )
+            if candidate is not None:
+                expected = json.loads(candidate.transition_json)
+                expected.update(state='completed', completed_at=updated_at)
+                completed = connection.execute('SELECT * FROM library_policy_transitions WHERE singleton=1').fetchone()
+                if (completed is None or dict(completed) != expected
+                        or connection.total_changes != before_completion_changes + 1):
+                    raise ValueError('Completed cohort transition changed during write.')
             return totals
 
         return await self._write(operation)
@@ -19947,6 +20246,70 @@ class NativeLibraryStore(PersistenceBase):
             )
 
         return await self._write(operation)
+
+    async def _put_cohort_source_snapshot_candidate(
+        self, snapshot: LibraryManagementMetadataSnapshot, source_context: "MbSourceContext",
+    ) -> tuple[LibraryManagementMetadataSnapshot, str]:
+        """LOCAL opt-in: pin a native response source and snapshot atomically.
+
+        No startup migration enables the candidate table. Only canonical import
+        projection after a matching repository response may use this path.
+        """
+        from repositories.musicbrainz_base import get_mb_response_context, mb_publish_if_current
+
+        if get_mb_response_context() != source_context:
+            raise StaleRevisionError("No matching canonical response source observation.")
+        if hashlib.sha256(snapshot.canonical_payload_json.encode()).hexdigest() != snapshot.payload_sha256:
+            raise ValidationError("The metadata snapshot payload hash does not match.")
+
+        def operation(connection: sqlite3.Connection) -> tuple[LibraryManagementMetadataSnapshot, str]:
+            connection.execute(
+                "INSERT OR IGNORE INTO library_management_metadata_snapshots "
+                "(id,provider,entity_kind,entity_id,input_hash,canonical_payload_json,payload_sha256,fetched_at,expires_at,provider_version_notes) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (snapshot.id,snapshot.provider,snapshot.entity_kind,snapshot.entity_id,snapshot.input_hash,
+                 snapshot.canonical_payload_json,snapshot.payload_sha256,snapshot.fetched_at,snapshot.expires_at,snapshot.provider_version_notes))
+            row = connection.execute(
+                "SELECT * FROM library_management_metadata_snapshots WHERE provider=? AND entity_kind=? AND entity_id=? AND input_hash=? AND payload_sha256=?",
+                (snapshot.provider,snapshot.entity_kind,snapshot.entity_id,snapshot.input_hash,snapshot.payload_sha256)).fetchone()
+            if row is None:
+                raise ConflictError("The metadata snapshot ID is already in use.")
+            stored = msgspec.convert(dict(row),type=LibraryManagementMetadataSnapshot,strict=False)
+            url_hash = hashlib.sha256(source_context.source_url.encode()).hexdigest()
+            proof_id = hashlib.sha256(json.dumps(
+                [stored.id,source_context.source_mode,source_context.source_id,source_context.generation,
+                 url_hash,stored.input_hash,stored.payload_sha256],separators=(',',':')).encode()).hexdigest()
+            connection.execute(
+                "INSERT OR IGNORE INTO library_import_cohort_snapshot_sources VALUES(?,?,?,?,?,?,?,?,?)",
+                (proof_id,stored.id,source_context.source_mode,source_context.source_id,source_context.generation,
+                 url_hash,stored.input_hash,stored.payload_sha256,snapshot.fetched_at))
+            return stored, proof_id
+
+        result = []
+        async def write():
+            result.append(await self._write(operation))
+        if not await mb_publish_if_current(source_context, write):
+            raise StaleRevisionError("Canonical source changed before snapshot publication.")
+        return result[0]
+
+    async def _get_cohort_source_snapshot_candidate(
+        self, snapshot_id: str, source_context: "MbSourceContext",
+    ) -> tuple[LibraryManagementMetadataSnapshot, str] | None:
+        """Read exact source/snapshot correlation; commit still uses source fence."""
+        def operation(connection: sqlite3.Connection):
+            row = connection.execute('SELECT * FROM library_management_metadata_snapshots WHERE id=?', (snapshot_id,)).fetchone()
+            if row is None:
+                return None
+            proofs = connection.execute(
+                'SELECT id FROM library_import_cohort_snapshot_sources WHERE metadata_snapshot_id=? '
+                'AND source_mode=? AND source_id=? AND source_generation=? AND source_url_sha256=? '
+                'AND input_hash=? AND payload_sha256=?',
+                (snapshot_id,source_context.source_mode,source_context.source_id,source_context.generation,
+                 hashlib.sha256(source_context.source_url.encode()).hexdigest(),row['input_hash'],row['payload_sha256'])).fetchall()
+            if len(proofs) != 1:
+                return None
+            return msgspec.convert(dict(row),type=LibraryManagementMetadataSnapshot,strict=False), str(proofs[0]['id'])
+        return await self._read(operation)
 
     async def get_management_metadata_snapshot(
         self, snapshot_id: str
@@ -24979,6 +25342,7 @@ class NativeLibraryStore(PersistenceBase):
         result_paths_by_ordinal: dict[int, str],
         updated_at: float,
         source_context: "MbSourceContext | None" = None,
+        _cohort_candidate: ImportCohortCommitCandidate | None = None,
     ) -> tuple[str, ...]:
         """Atomically adopt every published import and advance its journal."""
 
@@ -25010,6 +25374,11 @@ class NativeLibraryStore(PersistenceBase):
                 "cleanup_pending",
                 "completed",
             }:
+                if _cohort_candidate is not None:
+                    # Candidate replay is deliberately refused until the native
+                    # caller can renew filesystem/source leases and revalidate
+                    # a persisted binding; never silently bless stale evidence.
+                    raise StaleRevisionError("Cohort candidate replay needs fresh native validation.")
                 result = json.loads(str(bundle["result_json"]))
                 return tuple(str(value) for value in result.get("local_track_ids", []))
             if str(bundle["state"]) != "publishing":
@@ -25322,6 +25691,28 @@ class NativeLibraryStore(PersistenceBase):
                 requests=requests_by_ordinal,
                 now=updated_at,
             )
+            if _cohort_candidate is not None:
+                # LOCAL candidate only. No production caller supplies this and
+                # candidate DDL remains unregistered. This shares the catalog
+                # transaction; any failure rolls back adoption and journals.
+                from infrastructure.persistence.import_cohort_binding import persist_import_cohort
+
+                if replacement_track_ids or recycle_track_ids:
+                    raise ValidationError("Cohort candidate cannot replace or recycle tracks.")
+                album_ids = {write.album.id for _, write in writes}
+                fingerprints = dict(_cohort_candidate.fingerprints)
+                if len(album_ids) != 1 or set(fingerprints) != set(persisted):
+                    raise ValidationError("Cohort candidate must cover one complete adopted album.")
+                persist_import_cohort(
+                    connection, binding_id=_cohort_candidate.binding_id,
+                    bundle_id=bundle_id, album_id=next(iter(album_ids)),
+                    root_id=_cohort_candidate.root_id, root_path=_cohort_candidate.root_path,
+                    album_parent=_cohort_candidate.album_parent,
+                    canonical_map=_cohort_candidate.canonical_map,
+                    snapshot_seal=_cohort_candidate.snapshot, observed_at=updated_at,
+                    source_context=source_context,
+                    members={ordinal: (persisted[ordinal][0], fingerprints[ordinal])
+                             for ordinal in fingerprints})
             connection.execute(
                 "UPDATE library_management_import_journal SET state='catalog_committed',"
                 "updated_at=?,row_revision=row_revision+1 WHERE bundle_id=? "
@@ -25352,7 +25743,8 @@ class NativeLibraryStore(PersistenceBase):
                 raise StaleRevisionError("The import bundle changed before commit.")
             return tuple(ordered_track_ids)
 
-        if automatic_requests:
+        if automatic_requests or (_cohort_candidate is not None and _cohort_candidate.snapshot is not None
+                                  and _cohort_candidate.snapshot.source_proof_id is not None):
             if source_context is None:
                 raise ConfigurationError(
                     "Automatic import source context is required for catalog commit."

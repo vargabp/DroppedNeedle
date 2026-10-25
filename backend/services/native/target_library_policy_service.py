@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import msgspec
@@ -21,7 +22,7 @@ from api.v1.schemas.library_policies import (
     LibraryPolicyTreeResponse,
     TypedLibrarySettings,
 )
-from core.exceptions import TargetStartupInvariantError, ValidationError
+from core.exceptions import StaleRevisionError, TargetStartupInvariantError, ValidationError
 from infrastructure.persistence.native_library_store import NativeLibraryStore
 from services.native.library_policy_reconciliation_service import (
     LibraryPolicyReconciliationService,
@@ -39,12 +40,114 @@ class TargetLibraryPolicyService:
         *,
         on_settings_saved: Callable[[], None] | None = None,
         transition_lock: asyncio.Lock | None = None,
+        _cohort_settings_candidate_enabled: bool = False,
+        _cohort_filesystem=None,
+        _cohort_recovery_candidate_enabled: bool = False,
     ) -> None:
+        if _cohort_recovery_candidate_enabled and not _cohort_settings_candidate_enabled:
+            raise ValidationError('Private cohort recovery requires settings candidate opt-in.')
+        if _cohort_settings_candidate_enabled and (transition_lock is None or _cohort_filesystem is None):
+            raise ValidationError('Private cohort settings require explicit shared lock and coordinator.')
+        if _cohort_settings_candidate_enabled and reconciliation._store is not store:
+            raise ValidationError('Private cohort settings require one native transaction owner.')
         self._settings = settings
         self._reconciliation = reconciliation
         self._store = store
         self._on_settings_saved = on_settings_saved
         self._save_lock = transition_lock or asyncio.Lock()
+        self._cohort_settings_candidate_enabled = _cohort_settings_candidate_enabled
+        self._cohort_filesystem = _cohort_filesystem
+        self._cohort_recovery_candidate_enabled = _cohort_recovery_candidate_enabled
+
+    async def _recover_cohort_transition_candidate(self):
+        if not self._store._cohort_policy_transition_enabled or not self._store._cohort_policy_invalidation_enabled:
+            raise ValidationError('Private cohort store permissions required for recovery.')
+        transition = await self._store.get_policy_transition()
+        if transition is None or transition['state'] != 'prepared':
+            return False
+        previous = LibraryPolicyResolver(msgspec.json.decode(transition['previous_settings_json'], type=TypedLibrarySettings))
+        proposed = LibraryPolicyResolver(msgspec.json.decode(transition['proposed_settings_json'], type=TypedLibrarySettings))
+        if (previous.policy_revision != transition['previous_policy_revision']
+                or proposed.policy_revision != transition['proposed_policy_revision']):
+            raise TargetStartupInvariantError('Private recovery settings and prepared revisions disagree.')
+        roots = sorted({root.id for root in previous.settings.library_roots + proposed.settings.library_roots})
+        async with self._cohort_filesystem.write_many(roots):
+            async with self._save_lock:
+                if await self._store.get_policy_transition() != transition:
+                    raise StaleRevisionError('Prepared cohort recovery changed under root leases.')
+                current = LibraryPolicyResolver(self._settings.current_settings()).policy_revision
+                if current == previous.policy_revision:
+                    import hashlib
+                    import json
+                    import time
+                    def abort_seal(connection):
+                        row = connection.execute('SELECT * FROM library_policy_transitions WHERE singleton=1').fetchone()
+                        keys = ('previous_policy_revision', 'proposed_policy_revision', 'previous_settings_json',
+                            'proposed_settings_json', 'state', 'prepared_at', 'completed_at')
+                        if (row is None or any(row[key] != transition[key] for key in keys)
+                                or json.loads(row['scopes_json']) != msgspec.to_builtins(transition['scopes'])):
+                            raise StaleRevisionError('Private recovery abort journal changed.')
+                        return (previous.policy_revision, hashlib.sha256(json.dumps(dict(row), sort_keys=True).encode()).hexdigest())
+                    seal = await self._store._read(abort_seal)
+                    from services.native.import_cohort_scan_candidate import settle_cohort_write_candidate
+                    await settle_cohort_write_candidate(self._store.abort_policy_transition(
+                        proposed_policy_revision=proposed.policy_revision, aborted_at=time.time(),
+                        _cohort_recovery_abort_seal=seal))
+                    return True
+                if current != proposed.policy_revision:
+                    raise TargetStartupInvariantError('Private recovery configuration matches neither prepared revision.')
+                if self._on_settings_saved is not None:
+                    self._on_settings_saved()
+                from services.native.library_management_publisher import LibraryManagementPublisher
+                _, cancelled = await LibraryManagementPublisher._finish_critical_task(asyncio.create_task(
+                    self._commit_settings_boundary_candidate(proposed.policy_revision)))
+                self._settings.mark_scan_scopes_dirty(LibraryPolicyService._scope_ids(transition['scopes']))
+                if cancelled:
+                    raise asyncio.CancelledError
+                return True
+
+    @asynccontextmanager
+    async def _settings_save_scope_candidate(self, settings):
+        if not self._cohort_settings_candidate_enabled:
+            async with self._save_lock:
+                yield
+            return
+        if not self._store._cohort_policy_transition_enabled or not self._store._cohort_policy_invalidation_enabled:
+            raise ValidationError('Private cohort store permissions required for settings.')
+        previous = LibraryPolicyResolver(self._settings.current_settings())
+        proposed = LibraryPolicyResolver(settings)
+        root_ids = sorted({root.id for root in previous.settings.library_roots + proposed.settings.library_roots})
+        async with self._cohort_filesystem.write_many(root_ids):
+            async with self._save_lock:
+                if LibraryPolicyResolver(self._settings.current_settings()).policy_revision != previous.policy_revision:
+                    raise StaleRevisionError('Settings changed while acquiring cohort root leases.')
+                yield
+
+    async def _commit_settings_boundary_candidate(self, proposed_revision):
+        if not self._cohort_settings_candidate_enabled:
+            return await self._reconciliation.commit_boundary(proposed_policy_revision=proposed_revision)
+        import time
+        from infrastructure.persistence.import_cohort_binding import capture_cohort_policy_transition_candidate
+        current = LibraryPolicyResolver(self._settings.current_settings()).policy_revision
+        if current != proposed_revision or not self._save_lock.locked():
+            raise StaleRevisionError('Private settings configuration or policy scope changed.')
+        def discover(connection):
+            if not connection.in_transaction:
+                connection.execute('BEGIN')
+            return capture_cohort_policy_transition_candidate(connection, current)
+        seal = await self._store._read(discover)
+        if not all(self._cohort_filesystem._cohort_writer_is_held(root) for root in seal.root_ids):
+            raise ValidationError('Private settings previous/proposed root leases required.')
+        return await self._store.commit_policy_transition(proposed_policy_revision=proposed_revision,
+            updated_at=time.time(), _cohort_policy_transition_candidate=seal)
+
+    async def _abort_settings_boundary_candidate(self, proposed_revision):
+        from services.native.library_management_publisher import LibraryManagementPublisher
+        operation = self._reconciliation.abort_boundary(proposed_policy_revision=proposed_revision)
+        result, cancelled = await LibraryManagementPublisher._finish_critical_task(asyncio.create_task(operation))
+        if cancelled:
+            raise asyncio.CancelledError
+        return result
 
     @staticmethod
     def _settings_json(settings: TypedLibrarySettings) -> str:
@@ -53,18 +156,20 @@ class TargetLibraryPolicyService:
         return msgspec.json.encode(payload).decode()
 
     async def recover_pending_transition(self) -> bool:
+        if self._cohort_settings_candidate_enabled and self._cohort_recovery_candidate_enabled:
+            return await self._recover_cohort_transition_candidate()
         async with self._save_lock:
             transition = await self._store.get_policy_transition()
             if transition is None or transition["state"] != "prepared":
                 return False
+            if self._cohort_settings_candidate_enabled:
+                raise TargetStartupInvariantError('Private cohort startup recovery is not implemented; prepared evidence retained.')
             current_revision = LibraryPolicyResolver(
                 self._settings.current_settings()
             ).policy_revision
             proposed_revision = transition["proposed_policy_revision"]
             if current_revision == transition["previous_policy_revision"]:
-                await self._reconciliation.abort_boundary(
-                    proposed_policy_revision=proposed_revision
-                )
+                await self._abort_settings_boundary_candidate(proposed_revision)
                 return True
             if current_revision != proposed_revision:
                 raise TargetStartupInvariantError(
@@ -72,9 +177,11 @@ class TargetLibraryPolicyService:
                 )
             if self._on_settings_saved is not None:
                 self._on_settings_saved()
-            await self._reconciliation.commit_boundary(
-                proposed_policy_revision=proposed_revision
-            )
+            from services.native.library_management_publisher import LibraryManagementPublisher
+            _, cancelled = await LibraryManagementPublisher._finish_critical_task(asyncio.create_task(
+                self._reconciliation.commit_boundary(proposed_policy_revision=proposed_revision)))
+            if cancelled:
+                raise asyncio.CancelledError
             return True
 
     async def get_settings(self) -> LibrarySettingsResponse:
@@ -99,7 +206,7 @@ class TargetLibraryPolicyService:
         *,
         expected_policy_revision: str,
     ) -> LibrarySettingsResponse:
-        async with self._save_lock:
+        async with self._settings_save_scope_candidate(settings):
             previous_settings = self._settings.current_settings()
             previous_settings_raw = self._settings.current_settings_raw()
             previous_revision = LibraryPolicyResolver(previous_settings).policy_revision
@@ -137,14 +244,13 @@ class TargetLibraryPolicyService:
                     scopes=scopes,
                 )
             )
-            try:
-                await asyncio.shield(prepare_task)
-            except asyncio.CancelledError:
-                await prepare_task
-                await self._reconciliation.abort_boundary(
-                    proposed_policy_revision=proposed.policy_revision
-                )
-                raise
+            from services.native.library_management_publisher import LibraryManagementPublisher
+            # The ordinary path owns the same durable boundary: repeated caller
+            # cancellation must not abandon its prepare/abort/commit task either.
+            _, cancelled = await LibraryManagementPublisher._finish_critical_task(prepare_task)
+            if cancelled:
+                await self._abort_settings_boundary_candidate(proposed.policy_revision)
+                raise asyncio.CancelledError
             config_persisted = False
             try:
                 self._settings.persist_settings(
@@ -162,22 +268,14 @@ class TargetLibraryPolicyService:
                     )
                     if self._on_settings_saved is not None:
                         self._on_settings_saved()
-                await self._reconciliation.abort_boundary(
-                    proposed_policy_revision=proposed.policy_revision
-                )
+                await self._abort_settings_boundary_candidate(proposed.policy_revision)
                 raise
             commit_task = asyncio.create_task(
-                self._reconciliation.commit_boundary(
-                    proposed_policy_revision=proposed.policy_revision
-                )
+                self._commit_settings_boundary_candidate(proposed.policy_revision)
             )
             cancelled = False
             try:
-                try:
-                    immediate = await asyncio.shield(commit_task)
-                except asyncio.CancelledError:
-                    cancelled = True
-                    immediate = await commit_task
+                immediate, cancelled = await LibraryManagementPublisher._finish_critical_task(commit_task)
             except Exception:
                 self._settings.persist_settings(
                     previous_settings_raw,
@@ -185,17 +283,16 @@ class TargetLibraryPolicyService:
                 )
                 if self._on_settings_saved is not None:
                     self._on_settings_saved()
-                await self._reconciliation.abort_boundary(
-                    proposed_policy_revision=proposed.policy_revision
-                )
+                await self._abort_settings_boundary_candidate(proposed.policy_revision)
                 raise
-            if cancelled:
-                raise asyncio.CancelledError
             # S-01 Hook B writer: the restore path funnels through here too,
-            # so both settings entry points mark affected scopes dirty.
+            # so both settings entry points mark affected scopes dirty. A durable
+            # commit still needs its hint when caller cancellation is propagated.
             self._settings.mark_scan_scopes_dirty(
                 LibraryPolicyService._scope_ids(scopes)
             )
+            if cancelled:
+                raise asyncio.CancelledError
             current = await self.get_settings()
             payload = msgspec.to_builtins(current)
             payload["actions_applied"] = [

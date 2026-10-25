@@ -158,3 +158,4 @@ class CanonicalReleaseProjection(ImmutableManagementStruct):
     metadata_snapshot_id: str
     input_hash: str
     payload_sha256: str
+    cohort_source_proof_id: str | None = None

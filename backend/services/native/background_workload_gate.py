@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from time import monotonic
 from typing import AsyncIterator, Awaitable, Callable
 
@@ -11,6 +12,9 @@ logger = logging.getLogger(__name__)
 
 INTERACTIVE_QUIET_PERIOD_SECONDS = 5.0
 INTERACTIVE_MAX_DEFERRAL_SECONDS = 120.0
+_admitted_gates: ContextVar[frozenset[int]] = ContextVar(
+    "background_workload_admitted_gates", default=frozenset()
+)
 
 
 class BackgroundWorkloadGate:
@@ -73,17 +77,30 @@ class BackgroundWorkloadGate:
 
     @asynccontextmanager
     async def warmer_slot(self) -> AsyncIterator[None]:
-        """Serialize bounded proactive warmer units across warmer families."""
+        """Serialize and admit one complete bounded proactive warmer unit.
+
+        A unit may call ``wait_until_available`` at internal phase boundaries. Once
+        this slot has admitted the unit, those nested checks must not restart the
+        interactive deferral clock; the next unit rechecks admission when it takes
+        the slot.
+        """
         async with self._warmer_slot:
             await self.wait_until_available()
-            yield
+            admitted = _admitted_gates.get()
+            token = _admitted_gates.set(admitted | {id(self)})
+            try:
+                yield
+            finally:
+                _admitted_gates.reset(token)
 
     async def run_warmer_unit[T](self, operation: Callable[[], Awaitable[T]]) -> T:
-        await self.wait_until_available()
         async with self.warmer_slot():
             return await operation()
 
     async def wait_until_available(self) -> None:
+        if id(self) in _admitted_gates.get():
+            return
+
         started = monotonic()
         deferred = False
         forced = False

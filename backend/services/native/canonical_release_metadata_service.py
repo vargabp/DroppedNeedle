@@ -293,10 +293,12 @@ class CanonicalReleaseMetadataService:
         musicbrainz: CanonicalMusicBrainzRepositoryProtocol,
         *,
         clock: Callable[[], float] = time.time,
+        _capture_cohort_source: bool = False,
     ) -> None:
         self._store = store
         self._musicbrainz = musicbrainz
         self._clock = clock
+        self._capture_cohort_source = _capture_cohort_source
 
     async def build(
         self,
@@ -371,6 +373,11 @@ class CanonicalReleaseMetadataService:
     ) -> CanonicalReleaseProjection:
         """Resolve verified incoming positions to exact release-track identities."""
 
+        if self._capture_cohort_source:
+            from repositories.musicbrainz_base import capture_mb_source_context, clear_mb_response_context
+            source_context = source_context or capture_mb_source_context()
+            clear_mb_response_context()
+
         if not mappings:
             raise ProviderIdentityRequiredError(
                 "Every automatic import file needs an accepted release-track mapping."
@@ -388,6 +395,10 @@ class CanonicalReleaseMetadataService:
             raise ProviderIdentityRequiredError(
                 "The selected MusicBrainz release no longer exists; review this import."
             )
+        if self._capture_cohort_source:
+            from repositories.musicbrainz_base import get_mb_response_context, is_mb_source_current
+            if get_mb_response_context() != source_context or not is_mb_source_current(source_context):
+                raise ProviderIdentityRequiredError('The canonical response has no current native source provenance.')
         if release.release_group.id != release_group_mbid:
             raise ProviderIdentityRequiredError(
                 "The selected release no longer belongs to the requested release group."
@@ -466,7 +477,8 @@ class CanonicalReleaseMetadataService:
             tracks=tuple(accepted),
         )
         document = self._project(identity, release, profile)
-        return await self._snapshot(identity, profile, includes, document)
+        return await self._snapshot(identity, profile, includes, document,
+                                    cohort_source_context=source_context if self._capture_cohort_source else None)
 
     async def _fetch_release(
         self,
@@ -906,6 +918,7 @@ class CanonicalReleaseMetadataService:
         profile: LibraryManagementProfile,
         includes: tuple[str, ...],
         document: CanonicalReleaseDocument,
+        cohort_source_context: MbSourceContext | None = None,
     ) -> CanonicalReleaseProjection:
         input_json = _canonical_json(
             {
@@ -928,8 +941,7 @@ class CanonicalReleaseMetadataService:
         )
         now = self._clock()
         custom = document.identity_kind == "custom_edition"
-        snapshot = await self._store.put_management_metadata_snapshot(
-            LibraryManagementMetadataSnapshot(
+        snapshot = LibraryManagementMetadataSnapshot(
                 id=snapshot_id,
                 provider="droppedneedle" if custom else "musicbrainz",
                 entity_kind="custom_edition" if custom else "release",
@@ -950,10 +962,15 @@ class CanonicalReleaseMetadataService:
                     else _PROVIDER_NOTES
                 ),
             )
-        )
+        proof_id = None
+        if cohort_source_context is not None:
+            snapshot, proof_id = await self._store._put_cohort_source_snapshot_candidate(snapshot, cohort_source_context)
+        else:
+            snapshot = await self._store.put_management_metadata_snapshot(snapshot)
         return CanonicalReleaseProjection(
             document=document,
             metadata_snapshot_id=snapshot.id,
             input_hash=input_hash,
             payload_sha256=payload_hash,
+            cohort_source_proof_id=proof_id,
         )

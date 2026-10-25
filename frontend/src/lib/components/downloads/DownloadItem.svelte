@@ -159,7 +159,7 @@
 				{:else if cleanupState === 'needs_attention'}
 					<span
 						class="inline-flex items-center gap-1 text-[11px] text-error/80"
-						title="Your library is safe. The temporary copy was kept because it could not be verified safe to remove. DroppedNeedle retries automatically."
+						title="Your library is safe. The temporary copy was kept because it could not be verified safe to remove and needs review. Automatic safety checks continue."
 					>
 						<TriangleAlert class="size-3" /> Couldn't remove temporary files
 					</span>

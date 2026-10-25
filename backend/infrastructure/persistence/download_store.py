@@ -2133,6 +2133,25 @@ class DownloadStore(PersistenceBase):
 
         return await self._read(operation)
 
+    async def cleanup_warning_counts(self) -> dict[str, int]:
+        """Count warning tasks once, with safety holds taking precedence."""
+        def operation(conn: sqlite3.Connection) -> dict[str, int]:
+            row = conn.execute(
+                """SELECT COUNT(*) AS total,
+                          COALESCE(SUM(needs_attention), 0) AS needs_attention
+                   FROM (
+                       SELECT task_id, MAX(state='needs_attention') AS needs_attention
+                       FROM download_attempts
+                       WHERE state='needs_attention'
+                          OR (state IN ('cleanup_pending','workspace_removed')
+                              AND cleanup_failures>=3)
+                       GROUP BY task_id
+                   )"""
+            ).fetchone()
+            return {"total": int(row["total"]), "needs_attention": int(row["needs_attention"])}
+
+        return await self._read(operation)
+
     async def prune_completed_download_attempts(
         self, *, older_than: float, limit: int = 1000
     ) -> int:

@@ -54,7 +54,7 @@
 		const names = [...new Set(eligible.map((d) => serviceLabel(d.service)))];
 		const cleanup = eligible.find((d) => d.service === 'acquisition_cleanup');
 		if (cleanup && eligible.length === 1) {
-			// the backend message already carries the retry note - show it verbatim
+			// The backend distinguishes retries from protected copies needing review.
 			toastStore.show({
 				message: cleanup.message,
 				type: 'info'
@@ -64,7 +64,7 @@
 		if (cleanup) {
 			const serviceVerb = names.length === 1 ? 'is' : 'are';
 			toastStore.show({
-				message: `${names.join(', ')} ${serviceVerb} having problems. Retrying automatically.`,
+				message: `${names.join(', ')} ${serviceVerb} reporting issues. ${cleanup.message}`,
 				type: 'info'
 			});
 			return;

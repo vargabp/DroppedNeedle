@@ -10,6 +10,8 @@ import sqlite3
 import time
 import uuid
 from collections.abc import Callable
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -48,6 +50,7 @@ from core.exceptions import (
     AudioWriteError,
     AutomaticManagementHoldError,
     ConflictError,
+    ConfigurationError,
     LibraryManagementDestinationConflictError,
     LibraryManagementPolicyChangedError,
     StaleRevisionError,
@@ -56,6 +59,7 @@ from core.exceptions import (
 from repositories.musicbrainz_base import MbSourceContext, capture_mb_source_context
 
 if TYPE_CHECKING:
+    from models.library_management_canonical import CanonicalReleaseDocument
     from infrastructure.persistence.native_library_store import NativeLibraryStore
     from models.audio import AudioInfo, AudioTag
     from services.native.identification_queue_service import IdentificationQueueService
@@ -83,6 +87,12 @@ def _caused_by_os_error(error: BaseException) -> bool:
     return False
 
 
+class _CandidatePolicyScope:
+    def __init__(self) -> None:
+        self.task = asyncio.current_task()
+        self.active = True
+
+
 class TargetImportLibraryService:
     def __init__(
         self,
@@ -94,6 +104,7 @@ class TargetImportLibraryService:
         filesystem_coordinator: "LibraryFilesystemCoordinator | None" = None,
         management_publisher: "LibraryManagementPublisher | None" = None,
         automatic_management: "AutomaticImportManagementService | None" = None,
+        _cohort_import_candidate_enabled: bool = False,
     ) -> None:
         self._store = store
         self._resolver_getter = resolver_getter
@@ -102,6 +113,24 @@ class TargetImportLibraryService:
         self._filesystem = filesystem_coordinator
         self._management_publisher = management_publisher
         self._automatic_management = automatic_management
+        self._cohort_import_candidate_enabled = _cohort_import_candidate_enabled
+        self._candidate_policy_scope: ContextVar[_CandidatePolicyScope | None] = ContextVar('cohort_policy_scope', default=None)
+
+    @asynccontextmanager
+    async def _policy_scope_candidate(self):
+        """Only same-task lexical nesting borrows the actual held policy lock."""
+        owner = self._candidate_policy_scope.get()
+        if owner is not None and owner.active and owner.task is asyncio.current_task():
+            yield
+            return
+        async with self._policy_transition_lock:
+            owner = _CandidatePolicyScope()
+            token = self._candidate_policy_scope.set(owner)
+            try:
+                yield
+            finally:
+                owner.active = False
+                self._candidate_policy_scope.reset(token)
 
     def is_configured(self) -> bool:
         return bool(self._resolver_getter().settings.library_roots)
@@ -124,7 +153,7 @@ class TargetImportLibraryService:
             files: tuple[LibraryManagementPublishedImportFile, ...],
             commit_source_context: MbSourceContext | None,
         ) -> tuple[str, ...]:
-            async with self._policy_transition_lock:
+            async with self._policy_scope_candidate():
                 return await self._commit_published_import_bundle(
                     bundle_id,
                     files,
@@ -462,6 +491,9 @@ class TargetImportLibraryService:
         expected_policy_revision: str,
         source_context: MbSourceContext | None = None,
     ) -> tuple[str, ...]:
+        if self._cohort_import_candidate_enabled:
+            return await self._commit_cohort_import_candidate_callback(
+                bundle_id, files, expected_policy_revision=expected_policy_revision, source_context=source_context)
         resolver = self._resolver_getter()
         if resolver.policy_revision != expected_policy_revision:
             raise LibraryManagementPolicyChangedError(
@@ -572,6 +604,218 @@ class TargetImportLibraryService:
                     expected_policy_revision=expected_policy_revision,
                 )
         return track_ids
+
+    async def _commit_cohort_import_candidate_callback(
+        self, bundle_id: str, files: tuple[LibraryManagementPublishedImportFile, ...],
+        *, expected_policy_revision: str, source_context: MbSourceContext | None,
+    ) -> tuple[str, ...]:
+        """Default-OFF candidate callback; all original automatic guards run.
+
+        Must execute inside the real publisher's existing root write lease.
+        There is no standalone lease-acquisition fallback or user bypass flag.
+        """
+        from infrastructure.persistence.import_cohort_binding import CohortSnapshotSeal, ImportCohortCommitCandidate
+        from models.library_management_canonical import CanonicalReleaseDocument
+
+        async with self._policy_scope_candidate():
+            roots = {value.request.destination_root_id for value in files}
+            if (source_context is None or self._filesystem is None or len(roots) != 1
+                    or not self._filesystem._cohort_writer_is_held(next(iter(roots)))):
+                raise ConfigurationError('Cohort commit requires publisher-owned root lease and native source context.')
+            record = await self._store.get_library_management_import_bundle(bundle_id)
+            if (record is None or record.state != 'publishing'
+                    or hashlib.sha256(record.request_json.encode()).hexdigest() != record.request_hash):
+                raise StaleRevisionError('Cohort publication bundle is not sealed and publishing.')
+            bundle = msgspec.json.decode(record.request_json.encode(), type=LibraryManagementImportBundle)
+            if bundle.policy_revision != expected_policy_revision:
+                raise LibraryManagementPolicyChangedError('Cohort publication policy changed.')
+            snapshot_ids = {value.metadata_snapshot_id for value in bundle.files}
+            if (len(snapshot_ids) != 1 or None in snapshot_ids
+                    or any(value.pinned_profile is None for value in bundle.files)):
+                raise ValidationError('Cohort commit requires one complete pinned native canonical projection.')
+            correlated = await self._store._get_cohort_source_snapshot_candidate(next(iter(snapshot_ids)), source_context)
+            if correlated is None:
+                raise StaleRevisionError('No matching native canonical response source observation.')
+            snapshot, proof_id = correlated
+            canonical = msgspec.json.decode(snapshot.canonical_payload_json.encode(), type=CanonicalReleaseDocument)
+            writes, fingerprints, parent = await self._prepare_cohort_import_writes_candidate(
+                bundle, files, canonical, max_total_bytes=64 * 1024**3, timeout_seconds=120)
+            candidate = ImportCohortCommitCandidate(
+                binding_id=f'import-cohort:{bundle_id}', root_id=next(iter(roots)),
+                root_path=next(root.path for root in self._resolver_getter().settings.library_roots if root.id in roots),
+                album_parent=parent,
+                canonical_map=tuple((value.release_track_mbid, value.recording_mbid, value.medium_position,
+                                     value.release_track_position) for value in bundle.files),
+                fingerprints=tuple((int(ordinal), digest) for ordinal, digest in fingerprints.items()),
+                snapshot=CohortSnapshotSeal(snapshot_id=snapshot.id, input_hash=snapshot.input_hash,
+                    payload_sha256=snapshot.payload_sha256, source_proof_id=proof_id))
+            return await self._store.commit_library_management_import_bundle(
+                bundle_id, writes=writes, replacement_track_ids={}, recycle_track_ids={},
+                requests_by_ordinal={value.ordinal: value for value in bundle.files},
+                automatic_requests={value.ordinal: value for value in bundle.files},
+                expected_policy_revision=expected_policy_revision,
+                result_paths_by_ordinal={value.request.ordinal: value.destination_path for value in files},
+                updated_at=time.time(), source_context=source_context, _cohort_candidate=candidate)
+
+    async def _prepare_cohort_import_writes_candidate(
+        self,
+        bundle: LibraryManagementImportBundle,
+        files: tuple[LibraryManagementPublishedImportFile, ...],
+        canonical: "CanonicalReleaseDocument",
+        *,
+        max_total_bytes: int,
+        timeout_seconds: float,
+    ) -> tuple[list[tuple[int, ScannedTrackWrite]], dict[str, str], str]:
+        """LOCAL candidate only: prepare one complete NEW album before commit.
+
+        No publication caller uses this method. It never writes the catalog or
+        invokes commit/cleanup. Canonical provenance must still be supplied by
+        the native provider and pinned across the eventual atomic commit.
+        Coordinator/policy leases end on return; this is NOT a commit token.
+        """
+        from pathlib import PurePosixPath
+
+        from services.native.import_cohort_observation import observe_cohort_bytes
+        from services.native.library_management_publisher import LibraryManagementPublisher
+
+        LibraryManagementPublisher._validate_import_bundle(bundle)
+        if self._filesystem is None or bundle.origin != "acquisition":
+            raise ValidationError("Cohort preparation needs native coordination and acquisition scope.")
+        requests = {value.ordinal: value for value in bundle.files}
+        if len(files) != len(requests) or {value.request.ordinal for value in files} != set(requests):
+            raise ValidationError("A complete published cohort is required.")
+        if canonical.identity_kind != "exact_release" or not canonical.media or canonical.total_discs != len(canonical.media):
+            raise ValidationError("A complete exact-release canonical document is required.")
+        canonical_map = []
+        for medium in canonical.media:
+            if medium.track_count != len(medium.tracks) or medium.track_count < 1:
+                raise ValidationError("Canonical projection omits release tracks.")
+            for track in medium.tracks:
+                identity = track.identifiers
+                if (track.disc_number != medium.position or track.total_tracks != medium.track_count
+                        or track.total_discs != canonical.total_discs
+                        or identity.release_mbid != canonical.identifiers.release_mbid
+                        or identity.release_group_mbid != canonical.identifiers.release_group_mbid):
+                    raise ValidationError("Canonical medium or release identity disagrees.")
+                canonical_map.append((identity.release_track_mbid, identity.recording_mbid,
+                                      medium.position, track.track_number))
+        wanted = [(v.release_track_mbid, v.recording_mbid, v.medium_position, v.release_track_position)
+                  for v in bundle.files]
+        if (any(not rt or not rec or type(d) is not int or type(p) is not int or d < 1 or p < 1 for rt, rec, d, p in wanted)
+                or len({v[0] for v in wanted}) != len(wanted)
+                or len({v[2:] for v in wanted}) != len(wanted)
+                or sorted(wanted) != sorted(canonical_map)):
+            raise ValidationError("Complete distinct canonical recording mapping required.")
+        if any(not v.authoritative_mapping or v.reviewed_recording_identity
+               or v.source != "download" or v.replacement_local_track_id is not None
+               or v.conversion_recycle_only or not v.download_task_id
+               or (v.release_mbid, v.release_group_mbid) != (
+                   canonical.identifiers.release_mbid, canonical.identifiers.release_group_mbid)
+               for v in bundle.files):
+            raise ValidationError("Only a complete managed new acquisition is supported.")
+        if len({v.download_task_id for v in bundle.files}) != 1:
+            raise ValidationError("Mixed acquisition sources are not a cohort.")
+        root_ids = {v.destination_root_id for v in bundle.files}
+        if len(root_ids) != 1:
+            raise ValidationError("One configured root is required.")
+        root_id = next(iter(root_ids))
+        async with self._policy_scope_candidate(), self._filesystem._read_for_cohort_candidate(root_id):
+            resolver = self._resolver_getter()
+            if resolver.policy_revision != bundle.policy_revision:
+                raise LibraryManagementPolicyChangedError("Cohort policy changed.")
+            roots = [root for root in resolver.settings.library_roots if root.id == root_id]
+            if len(roots) != 1 or roots[0].policy != "automatic":
+                raise ValidationError("Configured automatic root required.")
+            root = Path(roots[0].path)
+            relative_paths = [PurePosixPath(v.destination_relative_path) for v in bundle.files]
+            common = os.path.commonpath([str(path.parent) for path in relative_paths])
+            parent = PurePosixPath(common)
+            if len(parent.parts) < 2 or str(parent) in (".", "/"):
+                raise ValidationError("A specific artist/album parent is required.")
+            contexts = set()
+            disc_directories = {}
+            observations = {}
+            for value in files:
+                request = requests[value.request.ordinal]
+                if msgspec.json.encode(request) != msgspec.json.encode(value.request):
+                    raise ValidationError("Published request differs from sealed request.")
+                relative = PurePosixPath(request.destination_relative_path)
+                tail = relative.relative_to(parent)
+                if len(tail.parts) not in (1, 2):
+                    raise ValidationError("Only flat or one-level medium layout is supported.")
+                if len(tail.parts) == 2:
+                    disc_directories.setdefault(tail.parts[0], set()).add(request.medium_position)
+                audio_path = root / request.destination_relative_path
+                if str(audio_path) != value.destination_path:
+                    raise ValidationError("Published path escaped configured root scope.")
+                resolution = resolver.resolve(audio_path)
+                if resolution is None or resolution.root_id != root_id or resolution.policy != "automatic":
+                    raise ValidationError("Cohort member has a different effective policy.")
+                tag = value.tag
+                if ((tag.musicbrainz_release_track_id, tag.musicbrainz_recording_id,
+                     tag.disc_number, tag.track_number) != (
+                         request.release_track_mbid, request.recording_mbid,
+                         request.medium_position, request.release_track_position)
+                        or (tag.musicbrainz_release_id, tag.musicbrainz_release_group_id) != (
+                            request.release_mbid, request.release_group_mbid)):
+                    raise ValidationError("Published tags disagree with canonical mapping.")
+                context = (normalize_group_value(tag.album), normalize_group_value(tag.album_artist or ""))
+                if not all(context):
+                    raise ValidationError("Explicit album tags required.")
+                contexts.add(context)
+                observations[str(request.ordinal)] = (
+                    request.destination_relative_path, revision_from_stat(audio_path.stat()))
+            if len(contexts) != 1 or any(len(value) != 1 for value in disc_directories.values()):
+                raise ValidationError("Conflicting album or medium contexts.")
+            if len({next(iter(value)) for value in disc_directories.values()}) != len(disc_directories):
+                raise ValidationError("A medium is spread across unrelated directories.")
+            if await self._import_reuse_album_id(canonical.identifiers.release_group_mbid):
+                raise ValidationError("Existing ownership requires separate native reuse validation.")
+            fingerprints = await asyncio.to_thread(
+                observe_cohort_bytes, root_path=str(root), members=observations,
+                max_total_bytes=max_total_bytes, timeout_seconds=timeout_seconds)
+            if any(fingerprints[str(v.request.ordinal)] != v.staged_fingerprint for v in files):
+                raise ValidationError("Published bytes differ from staged journal evidence.")
+            title, artist = next(iter(contexts))
+            grouping_key = f"{root_id}:{parent}:{title}:{artist}"
+            album_id = grouping_album_id(grouping_key)
+            if await self._store.get_local_album(album_id) is not None:
+                raise ValidationError("Candidate cannot adopt an existing album, including manual membership.")
+            writes = []
+            for value in sorted(files, key=lambda value: value.request.ordinal):
+                request = value.request
+                write = await self._build_published_import_write(
+                    Path(value.destination_path), value.tag, value.info, resolver=resolver,
+                    release_group_mbid=request.release_group_mbid, release_mbid=request.release_mbid,
+                    recording_mbid=request.recording_mbid, source=request.source,
+                    download_task_id=request.download_task_id, source_path=request.source_path,
+                    file_mtime=request.file_mtime)
+                if write.comparison_result != "new":
+                    raise ValidationError("Candidate cannot replace an existing catalog member.")
+                original_key = (
+                    f"{root_id}:{grouping_directory(write.relative_path)}:"
+                    f"{normalize_group_value(write.album.title)}:"
+                    f"{normalize_group_value(write.album.album_artist_name)}"
+                )
+                if write.album.id != grouping_album_id(original_key):
+                    raise ValidationError("Album ownership changed during candidate preparation.")
+                write = msgspec.structs.replace(
+                    write, album=msgspec.structs.replace(write.album, id=album_id, grouping_key=grouping_key),
+                    track=msgspec.structs.replace(write.track, local_album_id=album_id), grouping_context=str(parent))
+                writes.append((request.ordinal, write))
+            final_fingerprints = await asyncio.to_thread(
+                observe_cohort_bytes, root_path=str(root),
+                members={str(ordinal): (write.relative_path, write.track.stat_revision)
+                         for ordinal, write in writes},
+                max_total_bytes=max_total_bytes, timeout_seconds=timeout_seconds)
+            if final_fingerprints != fingerprints:
+                raise ValidationError("Cohort bytes changed during native write preparation.")
+            if (await self._store.get_local_album(album_id) is not None
+                    or await self._import_reuse_album_id(canonical.identifiers.release_group_mbid)):
+                raise ValidationError("Album ownership appeared during candidate preparation.")
+            if self._resolver_getter().policy_revision != bundle.policy_revision:
+                raise LibraryManagementPolicyChangedError("Cohort policy changed during preparation.")
+            return writes, fingerprints, str(parent)
 
     async def _build_published_import_write(
         self,

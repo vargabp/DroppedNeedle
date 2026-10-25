@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 from collections.abc import Awaitable, Callable
 from pathlib import PurePosixPath
 from typing import Any
+
+from core.exceptions import StaleRevisionError, ValidationError
 
 from infrastructure.persistence.native_library_store import NativeLibraryStore
 from models.identification import (
@@ -107,10 +110,59 @@ class LocalAlbumGroupingService:
         store: NativeLibraryStore,
         queue: IdentificationQueueService,
         grouper: LocalAlbumGrouper | None = None,
+        *,
+        _cohort_resolver_getter: Callable[[], Any] | None = None,
+        _cohort_filesystem: Any = None,
+        _cohort_max_total_bytes: int = 256 * 1024 * 1024,
+        _cohort_timeout_seconds: float = 10,
+        _cohort_tokens_candidate_enabled: bool = False,
+        _cohort_summaries_candidate_enabled: bool = False,
+        _cohort_continuity_candidate_enabled: bool = False,
+        _cohort_provision_candidate_enabled: bool = False,
+        _cohort_membership_candidate_enabled: bool = False,
+        _cohort_retirement_candidate_enabled: bool = False,
+        _cohort_queue_candidate_enabled: bool = False,
     ) -> None:
         self._store = store
         self._queue = queue
         self._grouper = grouper or LocalAlbumGrouper()
+        # Private disposable integration only. No production constructor enables
+        # this and candidate tables are deliberately not registered migrations.
+        if _cohort_resolver_getter is not None and _cohort_filesystem is None:
+            raise ValueError('Cohort grouping requires the native filesystem coordinator.')
+        self._cohort_resolver_getter = _cohort_resolver_getter
+        self._cohort_filesystem = _cohort_filesystem
+        self._cohort_max_total_bytes = _cohort_max_total_bytes
+        self._cohort_timeout_seconds = _cohort_timeout_seconds
+        self._cohort_tokens_candidate_enabled = _cohort_tokens_candidate_enabled
+        self._cohort_summaries_candidate_enabled = _cohort_summaries_candidate_enabled
+        self._cohort_continuity_candidate_enabled = _cohort_continuity_candidate_enabled
+        self._cohort_provision_candidate_enabled = _cohort_provision_candidate_enabled
+        self._cohort_membership_candidate_enabled = _cohort_membership_candidate_enabled
+        self._cohort_retirement_candidate_enabled = _cohort_retirement_candidate_enabled
+        self._cohort_queue_candidate_enabled = _cohort_queue_candidate_enabled
+
+    async def _cohort_binding_for_context(self, root_id: str, directory: str) -> str | None:
+        # Discovery only; fresh byte and SQL proof are still required at both
+        # writes. Never fall back to legacy grouping for a partial bound context.
+        rows = await self._store.get_grouping_context_tracks(root_id, directory)
+        ids = {str(row['id']) for row in rows}
+        def discover(connection):
+            bindings = {}
+            for track_id in ids:
+                for row in connection.execute('SELECT b.id,b.payload_json FROM library_import_cohort_bindings b '
+                        'JOIN library_import_cohort_members m ON m.binding_id=b.id WHERE m.local_track_id=?', (track_id,)):
+                    bindings[row['id']] = json.loads(row['payload_json'])
+            if not bindings:
+                return None
+            if len(bindings) != 1:
+                raise ValidationError('Multiple native cohorts share the grouping context.')
+            binding_id, payload = next(iter(bindings.items()))
+            if (payload['root_id'] != root_id or payload['album_parent'] != directory
+                    or {member['track']['id'] for member in payload['members']} != ids):
+                raise StaleRevisionError('Grouping context is not the exclusive complete native cohort.')
+            return binding_id
+        return await self._store._read(discover)
 
     async def regroup_run(
         self,
@@ -134,6 +186,37 @@ class LocalAlbumGroupingService:
                     relative_directory,
                     limit=STAGED_GROUPING_THRESHOLD + 1,
                 )
+                if self._cohort_resolver_getter is not None:
+                    if await self._store.count_grouping_context_candidates(root_id, relative_directory, limit=501) > 500:
+                        raise ValidationError('Private complete cohort exceeds observation member budget.')
+                    binding_id = await self._cohort_binding_for_context(root_id, relative_directory)
+                    if binding_id is None:
+                        # This private slice only admits complete bound contexts.
+                        # Falling through would permit an unfenced legacy write
+                        # if a binding arrived after the discovery read.
+                        raise ValidationError('Opt-in cohort grouping requires a complete bound context.')
+                    if binding_id is not None:
+                        from services.native.import_cohort_grouping_candidate import (
+                            apply_cohort_grouping_candidate, complete_cohort_grouping_candidate,
+                        )
+                        resolver = self._cohort_resolver_getter()
+                        if resolver.policy_revision != frozen_policy_revision:
+                            raise StaleRevisionError('Frozen cohort scan policy changed.')
+                        if candidate_count > STAGED_GROUPING_THRESHOLD:
+                            enqueued += await self._regroup_large_context(run_id, root_id, relative_directory,
+                                now=now, checkpoint=checkpoint, frozen_policy_revision=frozen_policy_revision,
+                                _cohort_binding_candidate=binding_id)
+                            continue
+                        arguments = dict(store=self._store, filesystem=self._cohort_filesystem,
+                            resolver=resolver, binding_id=binding_id, run_id=run_id, now=now,
+                            max_total_bytes=self._cohort_max_total_bytes,
+                            timeout_seconds=self._cohort_timeout_seconds)
+                        await apply_cohort_grouping_candidate(**arguments, grouper=self._grouper)
+                        dispositions = await complete_cohort_grouping_candidate(**arguments, checkpoint=checkpoint)
+                        if dispositions is None:
+                            return enqueued
+                        enqueued += sum(created for _, created in dispositions)
+                        continue
                 if candidate_count > STAGED_GROUPING_THRESHOLD:
                     enqueued += await self._regroup_large_context(
                         run_id,
@@ -268,6 +351,7 @@ class LocalAlbumGroupingService:
         now: float,
         checkpoint: Callable[[str, str], Awaitable[bool]] | None,
         frozen_policy_revision: str,
+        _cohort_binding_candidate: str | None = None,
     ) -> int:
         enqueued = 0
 
@@ -283,6 +367,17 @@ class LocalAlbumGroupingService:
             while True:
                 if not await continue_grouping():
                     return enqueued
+                if _cohort_binding_candidate is not None:
+                    from services.native.import_cohort_grouping_candidate import stage_cohort_track_page_candidate
+                    resolver = self._cohort_resolver_getter()
+                    if resolver.policy_revision != frozen_policy_revision:
+                        raise StaleRevisionError('Frozen cohort scan policy changed.')
+                    if await stage_cohort_track_page_candidate(store=self._store, filesystem=self._cohort_filesystem,
+                            resolver=resolver, binding_id=_cohort_binding_candidate, run_id=run_id,
+                            root_id=root_id, directory=relative_directory, limit=STAGING_BATCH_SIZE,
+                            max_total_bytes=self._cohort_max_total_bytes, timeout_seconds=self._cohort_timeout_seconds):
+                        break
+                    continue
                 rows, cursor = await self._store.get_grouping_context_track_page(
                     run_id,
                     root_id,
@@ -306,10 +401,25 @@ class LocalAlbumGroupingService:
                 if not rows:
                     break
             state = "tokens"
+        if _cohort_binding_candidate is not None and not self._cohort_tokens_candidate_enabled:
+            # Never enter unfenced native token/catalog/queue writes. This
+            # first paged slice durably stages exact evidence, nothing more.
+            raise ValidationError('Native paged cohort grouping is not integrated beyond validated track staging.')
         if state == "tokens":
             while True:
                 if not await continue_grouping():
                     return enqueued
+                if _cohort_binding_candidate is not None:
+                    from services.native.import_cohort_grouping_candidate import prepare_cohort_token_page_candidate
+                    resolver = self._cohort_resolver_getter()
+                    if resolver.policy_revision != frozen_policy_revision:
+                        raise StaleRevisionError('Frozen cohort scan policy changed.')
+                    if await prepare_cohort_token_page_candidate(store=self._store, filesystem=self._cohort_filesystem,
+                            resolver=resolver, binding_id=_cohort_binding_candidate, run_id=run_id,
+                            root_id=root_id, directory=relative_directory, limit=STAGING_BATCH_SIZE,
+                            max_total_bytes=self._cohort_max_total_bytes, timeout_seconds=self._cohort_timeout_seconds):
+                        break
+                    continue
                 if await self._store.prepare_staged_grouping_tokens(
                     run_id,
                     root_id,
@@ -318,10 +428,23 @@ class LocalAlbumGroupingService:
                 ):
                     break
             state = "groups"
+        if _cohort_binding_candidate is not None and not self._cohort_summaries_candidate_enabled:
+            raise ValidationError('Native paged cohort summaries are not integrated beyond validated tokens.')
         if state == "groups":
             while True:
                 if not await continue_grouping():
                     return enqueued
+                if _cohort_binding_candidate is not None:
+                    from services.native.import_cohort_grouping_candidate import summarize_cohort_page_candidate
+                    resolver = self._cohort_resolver_getter()
+                    if resolver.policy_revision != frozen_policy_revision:
+                        raise StaleRevisionError('Frozen cohort scan policy changed.')
+                    if await summarize_cohort_page_candidate(store=self._store, filesystem=self._cohort_filesystem,
+                            resolver=resolver, binding_id=_cohort_binding_candidate, run_id=run_id,
+                            root_id=root_id, directory=relative_directory, limit=STAGING_BATCH_SIZE,
+                            max_total_bytes=self._cohort_max_total_bytes, timeout_seconds=self._cohort_timeout_seconds):
+                        break
+                    continue
                 if await self._store.stage_grouping_summary_page(
                     run_id,
                     root_id,
@@ -330,6 +453,99 @@ class LocalAlbumGroupingService:
                 ):
                     break
             state = "continuity"
+        if _cohort_binding_candidate is not None and not self._cohort_continuity_candidate_enabled:
+            raise ValidationError('Native paged cohort continuity is not integrated beyond validated summaries.')
+        if _cohort_binding_candidate is not None:
+            async def retain(*, finish=False):
+                from services.native.import_cohort_grouping_candidate import retain_cohort_continuity_candidate
+                resolver = self._cohort_resolver_getter()
+                if resolver.policy_revision != frozen_policy_revision:
+                    raise StaleRevisionError('Frozen cohort scan policy changed.')
+                return await retain_cohort_continuity_candidate(store=self._store, filesystem=self._cohort_filesystem,
+                    resolver=resolver, binding_id=_cohort_binding_candidate, run_id=run_id,
+                    root_id=root_id, directory=relative_directory, limit=STAGING_BATCH_SIZE,
+                    max_total_bytes=self._cohort_max_total_bytes, timeout_seconds=self._cohort_timeout_seconds,
+                    finish=finish)
+            if state == 'continuity':
+                while True:
+                    if not await continue_grouping():
+                        return enqueued
+                    if not await retain():
+                        break
+                if not await continue_grouping():
+                    return enqueued
+                await retain(finish=True)
+                state = 'albums'
+            # This isolated path rejects wider graphs; retained-catalog
+            # provisioning requires a separate default-OFF fenced option.
+            if not self._cohort_provision_candidate_enabled:
+                raise ValidationError('Native paged cohort provisioning is not integrated beyond validated continuity.')
+            async def provision(*, finish=False):
+                from services.native.import_cohort_grouping_candidate import provision_cohort_album_candidate
+                resolver = self._cohort_resolver_getter()
+                if resolver.policy_revision != frozen_policy_revision:
+                    raise StaleRevisionError('Frozen cohort scan policy changed.')
+                return await provision_cohort_album_candidate(store=self._store, filesystem=self._cohort_filesystem,
+                    resolver=resolver, binding_id=_cohort_binding_candidate, run_id=run_id,
+                    root_id=root_id, directory=relative_directory, now=now,
+                    max_total_bytes=self._cohort_max_total_bytes, timeout_seconds=self._cohort_timeout_seconds, finish=finish)
+            if state == 'albums':
+                while True:
+                    if not await continue_grouping():
+                        return enqueued
+                    if not await provision():
+                        break
+                if not await continue_grouping():
+                    return enqueued
+                await provision(finish=True)
+                state = 'memberships'
+            if not self._cohort_membership_candidate_enabled:
+                raise ValidationError('Native paged cohort membership is not integrated beyond validated provisioning.')
+            if state == 'memberships':
+                from services.native.import_cohort_grouping_candidate import apply_cohort_membership_candidate
+                while True:
+                    if not await continue_grouping():
+                        return enqueued
+                    resolver = self._cohort_resolver_getter()
+                    if resolver.policy_revision != frozen_policy_revision:
+                        raise StaleRevisionError('Frozen cohort scan policy changed.')
+                    if await apply_cohort_membership_candidate(store=self._store, filesystem=self._cohort_filesystem,
+                            resolver=resolver, binding_id=_cohort_binding_candidate, run_id=run_id,
+                            root_id=root_id, directory=relative_directory, limit=STAGING_BATCH_SIZE,
+                            max_total_bytes=self._cohort_max_total_bytes, timeout_seconds=self._cohort_timeout_seconds):
+                        break
+                state = 'retirement'
+            if not self._cohort_retirement_candidate_enabled:
+                raise ValidationError('Native paged cohort retirement is not integrated beyond validated membership.')
+            if state == 'retirement':
+                from services.native.import_cohort_grouping_candidate import retire_cohort_album_candidate
+                while True:
+                    if not await continue_grouping():
+                        return enqueued
+                    resolver = self._cohort_resolver_getter()
+                    if resolver.policy_revision != frozen_policy_revision:
+                        raise StaleRevisionError('Frozen cohort scan policy changed.')
+                    if await retire_cohort_album_candidate(store=self._store, filesystem=self._cohort_filesystem,
+                            resolver=resolver, binding_id=_cohort_binding_candidate, run_id=run_id,
+                            root_id=root_id, directory=relative_directory, limit=STAGING_BATCH_SIZE, now=now,
+                            max_total_bytes=self._cohort_max_total_bytes, timeout_seconds=self._cohort_timeout_seconds):
+                        break
+                state = 'queue'
+            if not self._cohort_queue_candidate_enabled:
+                raise ValidationError('Native paged cohort queue is not integrated beyond validated retirement.')
+            if state != 'queue':
+                raise StaleRevisionError('Native private cohort queue phase changed.')
+            if not await continue_grouping():
+                return enqueued
+            from services.native.import_cohort_grouping_candidate import complete_paged_cohort_candidate
+            resolver = self._cohort_resolver_getter()
+            if resolver.policy_revision != frozen_policy_revision:
+                raise StaleRevisionError('Frozen cohort scan policy changed.')
+            results = await complete_paged_cohort_candidate(store=self._store, filesystem=self._cohort_filesystem,
+                resolver=resolver, binding_id=_cohort_binding_candidate, run_id=run_id,
+                root_id=root_id, directory=relative_directory, now=now,
+                max_total_bytes=self._cohort_max_total_bytes, timeout_seconds=self._cohort_timeout_seconds)
+            return enqueued + sum(created for _, created in results)
         if state == "continuity":
             while True:
                 if not await continue_grouping():

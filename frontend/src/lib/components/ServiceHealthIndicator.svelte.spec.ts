@@ -201,8 +201,7 @@ describe('ServiceHealthIndicator', () => {
 					service: 'acquisition_cleanup',
 					capability: 'source-files-with-cleanup',
 					severity: 'degraded',
-					message:
-						"Temporary files couldn't be removed for 1 download. Your library is safe. Retrying automatically.",
+					message: 'Temporary copies need review. Automatic safety checks continue.',
 					fallback: null,
 					degraded_seconds: 0
 				},
@@ -223,7 +222,9 @@ describe('ServiceHealthIndicator', () => {
 		const message = toast.show.mock.calls[0][0].message as string;
 		expect(message).toContain('Download cleanup');
 		expect(message).toContain('MusicBrainz');
-		expect(message).toContain('are having problems.');
+		expect(message).toContain('are reporting issues.');
+		expect(message).toContain('Temporary copies need review.');
+		expect(message).not.toContain('Retrying automatically.');
 	});
 	it('uses singular grammar when cleanup has multiple capabilities', async () => {
 		vi.spyOn(Date, 'now').mockReturnValue(START_TIME);
@@ -248,7 +249,7 @@ describe('ServiceHealthIndicator', () => {
 
 		await vi.waitFor(() => expect(toast.show).toHaveBeenCalledTimes(1));
 		const message = toast.show.mock.calls[0][0].message as string;
-		expect(message).toContain('Download cleanup is having problems.');
+		expect(message).toContain('Download cleanup is reporting issues.');
 		expect(message).not.toContain('Download cleanup are');
 	});
 	it('toasts immediately for a first degraded capability', async () => {

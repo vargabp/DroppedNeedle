@@ -44,6 +44,23 @@ _MAX_TREE_ENTRIES = 100_000
 _ATTENTION_RECHECK_SECONDS = 3600.0
 _UNRESOLVED_JOB_RETRIES = 4
 
+
+def _cleanup_health_message(count: int, needs_attention: int) -> str:
+    downloads = f"{count} download{'s' if count != 1 else ''}"
+    if needs_attention:
+        message = (
+            f"Temporary files are retained for {downloads}. Your library is safe. "
+            "Copies that cannot be verified safe to remove need review. "
+            "Automatic safety checks continue."
+        )
+        if count > needs_attention:
+            message += " Other temporary-file cleanup will retry automatically."
+        return message
+    return (
+        f"Temporary files couldn't be removed for {downloads}. "
+        "Your library is safe. Retrying automatically."
+    )
+
 # A folder qualifies as orphan debris only when no attempt journal owns it; the age
 # floor must comfortably exceed any crash window between SABnzbd materialising a
 # job and its attempt row being journaled (plus a full download+unpack), so a live
@@ -572,17 +589,14 @@ class AcquisitionCleanupService:
             raise _RetryableCleanup("attempt_revision_changed")
 
     async def _refresh_health(self) -> None:
-        count = await self._store.cleanup_warning_count()
+        counts = await self._store.cleanup_warning_counts()
+        count = counts["total"]
         if count:
             service_health.mark_degraded(
                 _HEALTH_SERVICE,
                 _HEALTH_CAPABILITY,
                 severity="degraded",
-                message=(
-                    f"Temporary files couldn't be removed for {count} "
-                    f"download{'s' if count != 1 else ''}. "
-                    "Your library is safe. Retrying automatically."
-                ),
+                message=_cleanup_health_message(count, counts["needs_attention"]),
                 ttl_seconds=90.0,
             )
         else:

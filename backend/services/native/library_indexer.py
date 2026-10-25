@@ -82,6 +82,9 @@ class LibraryIndexer:
         clock: Callable[[], float] = time.time,
         detached_tag_read_reap_multiplier: float = DETACHED_TAG_READ_REAP_MULTIPLIER,
         monotonic_clock: Callable[[], float] = time.monotonic,
+        _cohort_resolver_getter: Callable | None = None,
+        _cohort_max_total_bytes: int = 256 * 1024 * 1024,
+        _cohort_timeout_seconds: float = 10,
     ) -> None:
         if tag_read_timeout_seconds <= 0:
             raise ValueError("The tag-read timeout must be positive.")
@@ -95,6 +98,11 @@ class LibraryIndexer:
             store, IdentificationQueueService(store)
         )
         self._filesystem = filesystem_coordinator
+        if _cohort_resolver_getter is not None and filesystem_coordinator is None:
+            raise ValueError('Private cohort index requires native filesystem coordination.')
+        self._cohort_resolver_getter = _cohort_resolver_getter
+        self._cohort_max_total_bytes = _cohort_max_total_bytes
+        self._cohort_timeout_seconds = _cohort_timeout_seconds
         self._tag_read_timeout_seconds = tag_read_timeout_seconds
         self._max_detached_tag_reads = max_detached_tag_reads
         self._detached_tag_read_reap_multiplier = detached_tag_read_reap_multiplier
@@ -167,6 +175,14 @@ class LibraryIndexer:
                     frozen_policy_revision=frozen_policy_revision,
                 )
                 return counts
+            if self._cohort_resolver_getter is not None:
+                from services.native.import_cohort_scan_candidate import index_cohort_inventory_candidate
+                updated = await index_cohort_inventory_candidate(self, run, batch, counts, frozen_policy_revision, checkpoint)
+                if updated is None:
+                    return counts
+                run = updated
+                await self._report_progress(run, progress)
+                continue
             batch_counts = {
                 "indexed": 0,
                 "new": 0,

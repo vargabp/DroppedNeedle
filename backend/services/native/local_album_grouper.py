@@ -485,7 +485,17 @@ class LocalAlbumGrouper:
         tracks: list[GroupingTrack],
         *,
         existing: list[ExistingAlbumMembership] | None = None,
+        _cohort_directories_candidate: dict[str, str] | None = None,
     ) -> list[ProposedLocalAlbum]:
+        # Pure proposal context only, NEVER authority to persist or lock tracks.
+        # Native candidate caller validates the entire binding and fences SQL.
+        if _cohort_directories_candidate is not None and (
+            set(_cohort_directories_candidate) != {track.local_track_id for track in tracks}
+            or len({track.local_track_id for track in tracks}) != len(tracks)
+            or len({track.root_id for track in tracks}) != 1
+            or len(set(_cohort_directories_candidate.values())) != 1
+        ):
+            raise ValueError('Complete single-root cohort proposal context required')
         groups: dict[tuple[str, str, str], list[GroupingTrack]] = defaultdict(list)
         reasons: dict[tuple[str, str, str], str] = {}
 
@@ -496,6 +506,8 @@ class LocalAlbumGrouper:
                 reasons[key] = "MANUAL_MEMBERSHIP_RESTORED"
                 continue
             directory, disc = _directory_context(track)
+            if _cohort_directories_candidate is not None:
+                directory, disc = _cohort_directories_candidate[track.local_track_id], None
             album = normalize_group_value(track.album_title)
             album_artist = normalize_group_value(track.album_artist_name)
             if album:

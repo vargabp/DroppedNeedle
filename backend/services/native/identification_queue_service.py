@@ -98,6 +98,9 @@ class IdentificationQueueService:
         grouping_context: tuple[str, str] | None = None,
         queue_cursor: str | None = None,
         background: bool = False,
+        _cohort_completion_candidate=None,
+        _cohort_paged_completion_candidate=None,
+        _cohort_context_revision=None,
     ) -> list[tuple[str, bool]]:
         jobs = [
             self._album_job(
@@ -117,6 +120,11 @@ class IdentificationQueueService:
             queue_cursor=queue_cursor,
             background=background,
             resurrect_attention=self._resurrect_attention(),
+            **({'_cohort_completion_candidate': _cohort_completion_candidate}
+               if _cohort_completion_candidate is not None else {}),
+            **({'_cohort_paged_completion_candidate': _cohort_paged_completion_candidate,
+                '_cohort_context_revision': _cohort_context_revision}
+               if _cohort_paged_completion_candidate is not None else {}),
         )
 
     @staticmethod

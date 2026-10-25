@@ -8,6 +8,7 @@ import errno
 import threading
 from collections.abc import AsyncIterator, Callable, Iterable, Iterator
 from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
 import os
 from pathlib import Path
 from pathlib import PurePosixPath
@@ -134,6 +135,18 @@ class _RootLeaseState:
             return self.revision
 
 
+class _CandidateWriteScope:
+    """Revocable inherited scope, never a caller-supplied bypass flag."""
+
+    def __init__(self, roots: frozenset[str]) -> None:
+        self.roots = roots
+        self.loop = asyncio.get_running_loop()
+        self.active = True
+        self.borrowers = 0
+        self.drained = asyncio.Event()
+        self.drained.set()
+
+
 class LibraryFilesystemCoordinator:
     """Writer-preferring read/write leases, isolated by stable library-root ID.
 
@@ -145,6 +158,36 @@ class LibraryFilesystemCoordinator:
         self._states: dict[str, _RootLeaseState] = {}
         self._states_lock = threading.Lock()
         self._scan_revisions: dict[tuple[str, str], int] = {}
+        self._candidate_write_scopes: ContextVar[tuple[_CandidateWriteScope, ...]] = ContextVar(
+            'cohort_write_scopes', default=())
+
+    @asynccontextmanager
+    async def _read_for_cohort_candidate(self, root_id: str) -> AsyncIterator[None]:
+        """Borrow only this coordinator's still-held exclusive root lease.
+
+        Publisher critical children inherit the scope. Writer exit revokes new
+        borrows and waits for existing borrows before releasing the root lock.
+        Normal read/write APIs remain non-reentrant and writer-preferring.
+        """
+        scope = next((scope for scope in reversed(self._candidate_write_scopes.get())
+                      if scope.active and scope.loop is asyncio.get_running_loop() and root_id in scope.roots), None)
+        if scope is None:
+            async with self.read(root_id):
+                yield
+            return
+        scope.borrowers += 1
+        scope.drained.clear()
+        try:
+            yield
+        finally:
+            scope.borrowers -= 1
+            if scope.borrowers == 0:
+                scope.drained.set()
+
+    def _cohort_writer_is_held(self, root_id: str) -> bool:
+        """Internal observation, never a caller-supplied lease bypass."""
+        return any(scope.active and scope.loop is asyncio.get_running_loop() and root_id in scope.roots
+                   for scope in self._candidate_write_scopes.get())
 
     def _state(self, root_id: str) -> _RootLeaseState:
         if not root_id:
@@ -238,7 +281,23 @@ class LibraryFilesystemCoordinator:
                     state, state.acquire_registered_write_or_wait
                 )
                 acquired.append(state)
-            yield
+            scope = _CandidateWriteScope(frozenset(root_id for root_id, _ in states))
+            token = self._candidate_write_scopes.set((*self._candidate_write_scopes.get(), scope))
+            try:
+                yield
+            finally:
+                scope.active = False
+                self._candidate_write_scopes.reset(token)
+                if scope.borrowers:
+                    waiter = asyncio.create_task(scope.drained.wait())
+                    cancelled = False
+                    while not waiter.done():
+                        try:
+                            await asyncio.shield(waiter)
+                        except asyncio.CancelledError:
+                            cancelled = True
+                    if cancelled:
+                        raise asyncio.CancelledError
         finally:
             for state in reversed(acquired):
                 state.release_write()

@@ -162,6 +162,36 @@ async def test_triggered_warmer_waits_for_periodic_warmer_slot() -> None:
 
 
 @pytest.mark.asyncio
+async def test_admitted_warmer_unit_does_not_redefer_at_internal_boundaries() -> None:
+    gate = BackgroundWorkloadGate(
+        interactive_quiet_period=0.04,
+        interactive_max_deferral=0.1,
+    )
+    nested_wait_seconds = 1.0
+
+    async def operation() -> None:
+        nonlocal nested_wait_seconds
+        gate.begin_interactive_request()
+        started = monotonic()
+        try:
+            await gate.wait_until_available()
+        finally:
+            nested_wait_seconds = monotonic() - started
+            gate.end_interactive_request()
+
+    await gate.run_warmer_unit(operation)
+
+    assert nested_wait_seconds < 0.02
+    assert gate.deferred_waits == 0
+
+    # Admission is scoped to the bounded unit and must not leak to later callers.
+    started = monotonic()
+    await gate.wait_until_available()
+    assert monotonic() - started >= 0.03
+    assert gate.deferred_waits == 1
+
+
+@pytest.mark.asyncio
 async def test_queued_warmer_rechecks_interactive_admission_after_slot() -> None:
     gate = BackgroundWorkloadGate(
         interactive_quiet_period=0.03,

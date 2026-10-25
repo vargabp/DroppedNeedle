@@ -659,152 +659,151 @@ async def production_target_lifespan(app: FastAPI):
             recovery.needs_attention_bundles,
             recovery.skipped_bundles,
         )
-    async with target_startup_progress(settings, "operational_runtime"):
-        settings.instance_id = preferences.get_instance_id()
-        cache_instance = get_cache()
-        await cache_instance.clear()
-        advanced = preferences.get_advanced_settings()
-        start_cache_cleanup_task(
-            cache_instance, interval=advanced.memory_cache_cleanup_interval
-        )
-        start_memory_maintenance_task(cache_instance)
-        start_disk_cache_cleanup_task(
-            get_disk_cache(),
-            interval=advanced.disk_cache_cleanup_interval,
-            cover_disk_cache=get_target_consumer_composition().covers.disk_cache,
-        )
-        start_navidrome_playlist_export_task()
-
-        def root_paths() -> dict[str, Path]:
-            return {
-                root.id: Path(root.path)
-                for root in get_preferences_service()
-                .get_typed_library_settings()
-                .library_roots
-            }
-
-        timezone_name = _server_timezone_name()
-
-        def schedule_settings() -> dict[str, str]:
-            schedule = get_preferences_service().get_library_scan_schedule()
-            return {
-                "frequency": schedule.scan_frequency,
-                "daily_time": schedule.daily_scan_time,
-                "timezone_name": timezone_name,
-            }
-
-        work_wakeups = get_native_library_store().work_wakeups
-
-        def library_enabled() -> bool:
-            return get_preferences_service().get_typed_library_settings().enabled
-
-        def start_scan_supervisor() -> asyncio.Task[None]:
-            return start_target_scan_supervisor(
-                get_target_library_scan_coordinator,
-                root_paths,
-                work_wakeups,
-                scheduler_getter=get_target_library_scan_scheduler,
-                resolver_getter=get_library_policy_resolver,
-                schedule_settings_getter=schedule_settings,
-                dirty_scopes_getter=lambda: get_preferences_service()
-                .get_library_scan_dirty_scopes()
-                .scope_ids,
-                dirty_scopes_clearer=(
-                    get_preferences_service().clear_library_scan_dirty_scopes
-                ),
-            )
-
-        def mb_provider_state() -> CircuitState:
-            from repositories.musicbrainz_base import get_mb_provider_circuit_breaker
-
-            return get_mb_provider_circuit_breaker().state
-
-        async def probe_mb_provider() -> None:
-            # Thin background-priority probe mirroring verify_musicbrainz; the
-            # breaker records the outcome, resolving HALF_OPEN without traffic.
-            from infrastructure.queue.priority_queue import RequestPriority
-            from repositories.musicbrainz_base import mb_api_get
-
-            await mb_api_get(
-                "/artist",
-                params={"query": "test", "limit": 1},
-                priority=RequestPriority.BACKGROUND_SYNC,
-            )
-
-        def start_identification_worker() -> asyncio.Task[None]:
-            return start_target_identification_worker(
-                get_target_identification_queue,
-                get_target_album_identification_service,
-                work_wakeups,
-                workload_gate=get_background_workload_gate(),
-                provider_state_getter=mb_provider_state,
-                probe_provider=probe_mb_provider,
-                enabled_getter=library_enabled,
-            )
-
-        def start_operation_worker() -> asyncio.Task[None]:
-            return start_target_operation_worker(
-                get_target_library_operation_supervisor,
-                work_wakeups,
-                recovery_getter=get_library_management_recovery_service,
-                enabled_getter=library_enabled,
-            )
-
-        def start_contribution_worker() -> asyncio.Task[None]:
-            return start_library_contribution_verification_worker(
-                get_library_contribution_verification_worker,
-                work_wakeups,
-            )
-
-        def start_filesystem_watcher() -> asyncio.Task[None]:
-            return start_library_filesystem_watcher(
-                get_target_library_scan_coordinator,
-                root_paths,
-                work_wakeups,
-                scheduler_getter=get_target_library_scan_scheduler,
-                resolver_getter=get_library_policy_resolver,
-                watcher_settings_getter=(
-                    get_preferences_service().get_library_scan_filesystem_watcher
-                ),
-            )
-
-        worker_starters = {
-            SUPERVISOR_TASK_NAME: start_scan_supervisor,
-            IDENTIFICATION_WORKER_TASK_NAME: start_identification_worker,
-            OPERATION_WORKER_TASK_NAME: start_operation_worker,
-            CONTRIBUTION_VERIFICATION_WORKER_TASK_NAME: start_contribution_worker,
-            WATCHER_TASK_NAME: start_filesystem_watcher,
-        }
-        for start_worker in worker_starters.values():
-            start_worker()
-        start_target_worker_watchdog(worker_starters)
-        # (GH-293) Safe PASSIVE WAL checkpoint policy with high/low-water
-        # backpressure; registered, one sleep per iteration, never TRUNCATE.
-        from core.dependencies.service_providers import get_wal_checkpoint_service
-
-        start_target_wal_checkpoint_task(get_wal_checkpoint_service())
-        # Single process-wide library-revision poll feeding the mux SSE stream;
-        # replaces the per-connection poll loop in the old activity streams.
-        start_library_revision_poller(
-            get_target_identification_queue, get_sse_publisher
-        )
-        await start_target_operational_runtime(
-            settings=settings,
-            preferences=preferences,
-            auth_store=auth_store,
-        )
-        if library_enabled():
-            # F6/H6 pending-migration trigger 1 of 3 (live sites): scheduled
-            # once at startup. No periodic scheduler exists by design; a row
-            # missing this window waits for the next roots save or restore.
-            try:
-                await get_legacy_pending_migration_service().schedule()
-            except Exception:  # noqa: BLE001
-                logger.exception("Legacy pending migration scheduling failed")
-        logger.info("target_startup.operational_runtime_started")
-        logger.info("DroppedNeedle target application started")
-
     try:
+        async with target_startup_progress(settings, "operational_runtime"):
+            settings.instance_id = preferences.get_instance_id()
+            cache_instance = get_cache()
+            await cache_instance.clear()
+            advanced = preferences.get_advanced_settings()
+            start_cache_cleanup_task(
+                cache_instance, interval=advanced.memory_cache_cleanup_interval
+            )
+            start_memory_maintenance_task(cache_instance)
+            start_disk_cache_cleanup_task(
+                get_disk_cache(),
+                interval=advanced.disk_cache_cleanup_interval,
+                cover_disk_cache=get_target_consumer_composition().covers.disk_cache,
+            )
+            start_navidrome_playlist_export_task()
+
+            def root_paths() -> dict[str, Path]:
+                return {
+                    root.id: Path(root.path)
+                    for root in get_preferences_service()
+                    .get_typed_library_settings()
+                    .library_roots
+                }
+
+            timezone_name = _server_timezone_name()
+
+            def schedule_settings() -> dict[str, str]:
+                schedule = get_preferences_service().get_library_scan_schedule()
+                return {
+                    "frequency": schedule.scan_frequency,
+                    "daily_time": schedule.daily_scan_time,
+                    "timezone_name": timezone_name,
+                }
+
+            work_wakeups = get_native_library_store().work_wakeups
+
+            def library_enabled() -> bool:
+                return get_preferences_service().get_typed_library_settings().enabled
+
+            def start_scan_supervisor() -> asyncio.Task[None]:
+                return start_target_scan_supervisor(
+                    get_target_library_scan_coordinator,
+                    root_paths,
+                    work_wakeups,
+                    scheduler_getter=get_target_library_scan_scheduler,
+                    resolver_getter=get_library_policy_resolver,
+                    schedule_settings_getter=schedule_settings,
+                    dirty_scopes_getter=lambda: get_preferences_service()
+                    .get_library_scan_dirty_scopes()
+                    .scope_ids,
+                    dirty_scopes_clearer=(
+                        get_preferences_service().clear_library_scan_dirty_scopes
+                    ),
+                )
+
+            def mb_provider_state() -> CircuitState:
+                from repositories.musicbrainz_base import get_mb_provider_circuit_breaker
+
+                return get_mb_provider_circuit_breaker().state
+
+            async def probe_mb_provider() -> None:
+                # Thin background-priority probe mirroring verify_musicbrainz; the
+                # breaker records the outcome, resolving HALF_OPEN without traffic.
+                from infrastructure.queue.priority_queue import RequestPriority
+                from repositories.musicbrainz_base import mb_api_get
+
+                await mb_api_get(
+                    "/artist",
+                    params={"query": "test", "limit": 1},
+                    priority=RequestPriority.BACKGROUND_SYNC,
+                )
+
+            def start_identification_worker() -> asyncio.Task[None]:
+                return start_target_identification_worker(
+                    get_target_identification_queue,
+                    get_target_album_identification_service,
+                    work_wakeups,
+                    workload_gate=get_background_workload_gate(),
+                    provider_state_getter=mb_provider_state,
+                    probe_provider=probe_mb_provider,
+                    enabled_getter=library_enabled,
+                )
+
+            def start_operation_worker() -> asyncio.Task[None]:
+                return start_target_operation_worker(
+                    get_target_library_operation_supervisor,
+                    work_wakeups,
+                    recovery_getter=get_library_management_recovery_service,
+                    enabled_getter=library_enabled,
+                )
+
+            def start_contribution_worker() -> asyncio.Task[None]:
+                return start_library_contribution_verification_worker(
+                    get_library_contribution_verification_worker,
+                    work_wakeups,
+                )
+
+            def start_filesystem_watcher() -> asyncio.Task[None]:
+                return start_library_filesystem_watcher(
+                    get_target_library_scan_coordinator,
+                    root_paths,
+                    work_wakeups,
+                    scheduler_getter=get_target_library_scan_scheduler,
+                    resolver_getter=get_library_policy_resolver,
+                    watcher_settings_getter=(
+                        get_preferences_service().get_library_scan_filesystem_watcher
+                    ),
+                )
+
+            worker_starters = {
+                SUPERVISOR_TASK_NAME: start_scan_supervisor,
+                IDENTIFICATION_WORKER_TASK_NAME: start_identification_worker,
+                OPERATION_WORKER_TASK_NAME: start_operation_worker,
+                CONTRIBUTION_VERIFICATION_WORKER_TASK_NAME: start_contribution_worker,
+                WATCHER_TASK_NAME: start_filesystem_watcher,
+            }
+            for start_worker in worker_starters.values():
+                start_worker()
+            start_target_worker_watchdog(worker_starters)
+            # (GH-293) Safe PASSIVE WAL checkpoint policy with high/low-water
+            # backpressure; registered, one sleep per iteration, never TRUNCATE.
+            from core.dependencies.service_providers import get_wal_checkpoint_service
+
+            start_target_wal_checkpoint_task(get_wal_checkpoint_service())
+            # Single process-wide library-revision poll feeding the mux SSE stream;
+            # replaces the per-connection poll loop in the old activity streams.
+            start_library_revision_poller(
+                get_target_identification_queue, get_sse_publisher
+            )
+            await start_target_operational_runtime(
+                settings=settings,
+                preferences=preferences,
+                auth_store=auth_store,
+            )
+            if library_enabled():
+                # F6/H6 pending-migration trigger 1 of 3 (live sites): scheduled
+                # once at startup. No periodic scheduler exists by design; a row
+                # missing this window waits for the next roots save or restore.
+                try:
+                    await get_legacy_pending_migration_service().schedule()
+                except Exception:  # noqa: BLE001
+                    logger.exception("Legacy pending migration scheduling failed")
+            logger.info("target_startup.operational_runtime_started")
+            logger.info("DroppedNeedle target application started")
         yield
     finally:
         registry = TaskRegistry.get_instance()
