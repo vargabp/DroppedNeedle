@@ -52,6 +52,7 @@ jobs:
           push: false
           build-args: |
             COMMIT_TAG=${{ steps.version.outputs.tag }}
+            DROPPEDNEEDLE_UPSTREAM_VERSION=${{ steps.version.outputs.tag }}
             BUILD_DATE=${{ steps.date.outputs.timestamp }}
           cache-from: type=gha,scope=${{ matrix.platform }}
           cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
@@ -123,6 +124,7 @@ jobs:
           tags: ${{ env.TAGS }}
           build-args: |
             COMMIT_TAG=${{ steps.version.outputs.tag }}
+            DROPPEDNEEDLE_UPSTREAM_VERSION=${{ steps.version.outputs.tag }}
             BUILD_DATE=${{ steps.date.outputs.timestamp }}
           cache-from: |
             type=gha,scope=linux/amd64

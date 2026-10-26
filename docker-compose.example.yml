@@ -20,7 +20,7 @@ services:
       # - BIND_HOST=auto      # dual-stack (IPv4 + IPv6) listener; set 0.0.0.0 to pin IPv4 only
       # - TRUSTED_PROXY_IPS=172.17.0.1  # your reverse proxy's IP/CIDR; defaults to the loopbacks 127.0.0.1,::1
       # Optional compatibility overrides; omitting them preserves the published defaults.
-      # - LISTENBRAINZ_RATE_LIMIT=1.0  # published default: 2.5 requests/second; burst capacity remains 1
+      # - LISTENBRAINZ_RATE_LIMIT=1.0  # default: documented 1 request/second; burst capacity remains 1
       # - "LISTENBRAINZ_USER_AGENT=ExampleMusic/1.0 ( https://example.invalid/contact )"
       # - BACKGROUND_WORKLOAD_UNIT_ADMISSION_ENABLED=true  # prevents nested phase checks from re-deferring one admitted unit
     ports:

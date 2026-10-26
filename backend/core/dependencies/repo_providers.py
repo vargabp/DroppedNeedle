@@ -518,6 +518,17 @@ def get_play_history_store() -> "PlayHistoryStore":
 
 
 @singleton
+def get_scrobble_outbox_store() -> "ScrobbleOutboxStore":
+    from infrastructure.persistence.scrobble_outbox_store import ScrobbleOutboxStore
+    from .cache_providers import get_persistence_write_lock
+
+    settings = get_settings()
+    return ScrobbleOutboxStore(
+        db_path=settings.library_db_path, write_lock=get_persistence_write_lock()
+    )
+
+
+@singleton
 def get_follow_store() -> "FollowStore":
     from infrastructure.persistence.follow_store import FollowStore
     from .cache_providers import get_persistence_write_lock

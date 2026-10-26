@@ -67,7 +67,10 @@ export function makeScrobbleSubmission(
 function createScrobbleManager() {
 	let status = $state<ScrobbleStatus>('idle');
 	let enabled = $state(false);
-	let lastServiceDetail = $state<Record<string, { success: boolean }> | null>(null);
+	let lastServiceDetail = $state<Record<
+		string,
+		{ success: boolean; status?: 'delivered' | 'pending' | 'failed' }
+	> | null>(null);
 	let track: TrackState | null = null;
 	let settingsCache: ScrobbleSettings | null = null;
 	let lastSettingsFetch = 0;
@@ -124,7 +127,7 @@ function createScrobbleManager() {
 			);
 			const data = await api.global.post<ScrobbleResponse>(API.scrobble.submit(), body);
 			lastServiceDetail = Object.fromEntries(
-				Object.entries(data.services).map(([k, v]) => [k, { success: v.success }])
+				Object.entries(data.services).map(([k, v]) => [k, { success: v.success, status: v.status }])
 			);
 			if (data.accepted) {
 				status = 'scrobbled';

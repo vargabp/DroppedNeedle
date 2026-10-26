@@ -100,11 +100,46 @@ class TestLrclibDurationTolerance:
 # D. Optional operational overrides
 
 class TestOperationalOverrides:
+    @pytest.mark.parametrize("commit_tag", ["", "   "])
+    def test_blank_commit_tag_uses_valid_development_version(
+        self, monkeypatch: pytest.MonkeyPatch, commit_tag: str
+    ) -> None:
+        monkeypatch.setenv("COMMIT_TAG", commit_tag)
+
+        settings = _make_settings(_env_file=None)
+
+        assert settings.get_user_agent().startswith("DroppedNeedleApp/dev (")
+
+    def test_listenbrainz_uses_baked_upstream_version_for_fork_build(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("COMMIT_TAG", "dev-f9df591")
+        monkeypatch.setenv("DROPPEDNEEDLE_UPSTREAM_VERSION", "v2.15.0")
+
+        settings = _make_settings(_env_file=None)
+
+        assert settings.get_user_agent().startswith("DroppedNeedleApp/dev-f9df591 (")
+        assert settings.get_listenbrainz_user_agent().startswith(
+            "DroppedNeedleApp/v2.15.0 ("
+        )
+
+    @pytest.mark.parametrize("upstream_version", ["", "   ", "bad version"])
+    def test_missing_or_invalid_upstream_version_falls_back_to_build_version(
+        self, monkeypatch: pytest.MonkeyPatch, upstream_version: str
+    ) -> None:
+        monkeypatch.setenv("COMMIT_TAG", "dev-f9df591")
+        monkeypatch.setenv("DROPPEDNEEDLE_UPSTREAM_VERSION", upstream_version)
+
+        settings = _make_settings(_env_file=None)
+
+        assert settings.get_listenbrainz_user_agent() == settings.get_user_agent()
+
     def test_defaults_preserve_published_behaviour(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         for name in (
             "BACKGROUND_WORKLOAD_UNIT_ADMISSION_ENABLED",
+            "DROPPEDNEEDLE_UPSTREAM_VERSION",
             "LISTENBRAINZ_RATE_LIMIT",
             "LISTENBRAINZ_USER_AGENT",
         ):
@@ -113,7 +148,7 @@ class TestOperationalOverrides:
         settings = _make_settings(_env_file=None)
 
         assert settings.background_workload_unit_admission_enabled is False
-        assert settings.listenbrainz_rate_limit == pytest.approx(2.5)
+        assert settings.listenbrainz_rate_limit == pytest.approx(1.0)
         assert settings.listenbrainz_user_agent == ""
         assert settings.get_listenbrainz_user_agent() == settings.get_user_agent()
 
@@ -121,6 +156,7 @@ class TestOperationalOverrides:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("BACKGROUND_WORKLOAD_UNIT_ADMISSION_ENABLED", "true")
+        monkeypatch.setenv("DROPPEDNEEDLE_UPSTREAM_VERSION", "v2.15.0")
         monkeypatch.setenv("LISTENBRAINZ_RATE_LIMIT", "1.0")
         monkeypatch.setenv(
             "LISTENBRAINZ_USER_AGENT",

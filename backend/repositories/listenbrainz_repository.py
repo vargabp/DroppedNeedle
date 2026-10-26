@@ -11,6 +11,7 @@ import msgspec
 from core.config import Settings
 from core.exceptions import (
     ExternalServiceError,
+    NonRetriableExternalServiceError,
     RateLimitedError,
     ServiceDisabledUpstreamError,
 )
@@ -80,6 +81,15 @@ _RATE_LIMIT_MAX_DELAY_SECONDS = 3600.0
 _RATE_LIMIT_HEALTH_MESSAGE = (
     "ListenBrainz is temporarily rate-limiting this server. Try again shortly."
 )
+
+# TokenBucketRateLimiter is a min-priority queue.  User-initiated credential
+# checks and playback writes must be admitted before optional discovery reads;
+# otherwise a discovery fan-out can continuously occupy the only safe upstream
+# slot and make scrobbling or account setup fail locally without reaching LB.
+LISTENBRAINZ_PRIORITY_INTERACTIVE = -20
+LISTENBRAINZ_PRIORITY_SCROBBLE = -10
+LISTENBRAINZ_PRIORITY_READ = 0
+_PRIORITY_COOLDOWN_WAIT_SECONDS = 5.0
 
 
 def _parse_nonnegative_header(headers: Any, name: str) -> float | None:
@@ -417,7 +427,7 @@ def _is_upstream_policy_block(response: httpx.Response) -> bool:
     return False
 
 
-class _ListenBrainzAuthenticationError(ExternalServiceError):
+class _ListenBrainzAuthenticationError(NonRetriableExternalServiceError):
     """Deterministic credential rejection that must never be retried."""
 
 
@@ -478,9 +488,10 @@ def _build_listenbrainz_rate_limiter() -> TokenBucketRateLimiter:
     )
 
 
-# Preserve the published 2.5 requests/second baseline unless an operator supplies
-# LISTENBRAINZ_RATE_LIMIT (for example, 1.0 for the documented public ceiling).
-# Capacity remains one so neither path permits a cold burst.
+# Default to ListenBrainz's documented application ceiling.  An operator can
+# still supply LISTENBRAINZ_RATE_LIMIT when response headers demonstrate that
+# the authenticated application has a higher allowance.  Capacity remains one
+# so no path permits a cold burst.
 _listenbrainz_rate_limiter = _build_listenbrainz_rate_limiter()
 _metadata_deduplicator = RequestDeduplicator()
 
@@ -603,12 +614,16 @@ class ListenBrainzRepository:
         json_data: dict[str, Any] | None = None,
         require_auth: bool = False,
         accepted_statuses: tuple[int, ...] = (),
+        priority: int = LISTENBRAINZ_PRIORITY_READ,
+        wait_for_cooldown: bool = False,
     ) -> Any:
         reservation = reserve_optional_operation()
         try:
             return await self._request_attempt(
                 method, endpoint, params, json_data, require_auth, accepted_statuses,
                 reservation,
+                priority,
+                wait_for_cooldown,
             )
         finally:
             if reservation is not None:
@@ -644,6 +659,8 @@ class ListenBrainzRepository:
         require_auth: bool = False,
         accepted_statuses: tuple[int, ...] = (),
         reservation: OptionalWorkReservation | None = None,
+        priority: int = LISTENBRAINZ_PRIORITY_READ,
+        wait_for_cooldown: bool = False,
     ) -> Any:
         url = f"{self._base_url}{endpoint}"
 
@@ -660,17 +677,35 @@ class ListenBrainzRepository:
         # _get/_post perform the read-token resolution and validation before
         # entering this decorated method.
 
-        admission_delay = _listenbrainz_rate_limit_state.admission_delay()
-        if admission_delay is not None:
-            raise RateLimitedError(
-                _RATE_LIMIT_HEALTH_MESSAGE,
-                retry_after_seconds=admission_delay,
-            )
+        # Optional reads fail fast while an upstream response window is closed.
+        # Priority traffic enters the pacing queue first so it can jump queued
+        # discovery reads, then waits for a short known cooldown rather than
+        # failing locally before its credential check or listen reaches LB.
+        if not wait_for_cooldown:
+            admission_delay = _listenbrainz_rate_limit_state.admission_delay()
+            if admission_delay is not None:
+                raise RateLimitedError(
+                    _RATE_LIMIT_HEALTH_MESSAGE,
+                    retry_after_seconds=admission_delay,
+                )
 
         async with self._request_semaphore:
             # Pace only requests that have won a wire-attempt slot.  Waiting for
             # this semaphore must not consume the capacity-1 pacing token.
-            await _listenbrainz_rate_limiter.acquire()
+            await _listenbrainz_rate_limiter.acquire(priority=priority)
+
+            wait_budget = _PRIORITY_COOLDOWN_WAIT_SECONDS
+            while True:
+                admission_delay = _listenbrainz_rate_limit_state.admission_delay()
+                if admission_delay is None:
+                    break
+                if not wait_for_cooldown or admission_delay > wait_budget:
+                    raise RateLimitedError(
+                        _RATE_LIMIT_HEALTH_MESSAGE,
+                        retry_after_seconds=admission_delay,
+                    )
+                await asyncio.sleep(admission_delay)
+                wait_budget -= admission_delay
 
             # Reserve immediately before the wire attempt.  A request can wait
             # for this semaphore while another request observes a 429 and opens
@@ -796,6 +831,8 @@ class ListenBrainzRepository:
         params: dict[str, Any] | None = None,
         require_auth: bool = False,
         accepted_statuses: tuple[int, ...] = (),
+        priority: int = LISTENBRAINZ_PRIORITY_READ,
+        wait_for_cooldown: bool = False,
     ) -> Any:
         if require_auth:
             self._require_own_token()
@@ -808,10 +845,17 @@ class ListenBrainzRepository:
             params=params,
             require_auth=require_auth,
             accepted_statuses=accepted_statuses,
+            priority=priority,
+            wait_for_cooldown=wait_for_cooldown,
         )
 
     async def _post(
-        self, endpoint: str, data: dict[str, Any], require_auth: bool = False
+        self,
+        endpoint: str,
+        data: dict[str, Any],
+        require_auth: bool = False,
+        priority: int = LISTENBRAINZ_PRIORITY_READ,
+        wait_for_cooldown: bool = False,
     ) -> Any:
         if require_auth:
             self._require_own_token()
@@ -819,7 +863,12 @@ class ListenBrainzRepository:
             await self._ensure_read_token()
             self._validate_read_token()
         return await self._request(
-            "POST", endpoint, json_data=data, require_auth=require_auth
+            "POST",
+            endpoint,
+            json_data=data,
+            require_auth=require_auth,
+            priority=priority,
+            wait_for_cooldown=wait_for_cooldown,
         )
 
     async def validate_username(self, username: str | None = None) -> tuple[bool, str]:
@@ -831,6 +880,8 @@ class ListenBrainzRepository:
             result = await self._get(
                 f"/1/user/{user}/listen-count",
                 accepted_statuses=(404,),
+                priority=LISTENBRAINZ_PRIORITY_INTERACTIVE,
+                wait_for_cooldown=True,
             )
             if result is None:
                 return False, f"User '{user}' not found"
@@ -867,6 +918,8 @@ class ListenBrainzRepository:
             result = await self._get(
                 "/1/validate-token",
                 accepted_statuses=(401, 403),
+                priority=LISTENBRAINZ_PRIORITY_INTERACTIVE,
+                wait_for_cooldown=True,
             )
             if isinstance(result, dict) and result.get("valid"):
                 username = result.get("user_name", self._username)
@@ -1573,7 +1626,13 @@ class ListenBrainzRepository:
             "listen_type": "playing_now",
             "payload": [{"track_metadata": track_metadata}],
         }
-        await self._post("/1/submit-listens", payload, require_auth=True)
+        await self._post(
+            "/1/submit-listens",
+            payload,
+            require_auth=True,
+            priority=LISTENBRAINZ_PRIORITY_SCROBBLE,
+            wait_for_cooldown=True,
+        )
         return True
 
     async def submit_single_listen(
@@ -1602,7 +1661,13 @@ class ListenBrainzRepository:
                 }
             ],
         }
-        await self._post("/1/submit-listens", payload, require_auth=True)
+        await self._post(
+            "/1/submit-listens",
+            payload,
+            require_auth=True,
+            priority=LISTENBRAINZ_PRIORITY_SCROBBLE,
+            wait_for_cooldown=True,
+        )
         return True
 
     async def get_recommendation_playlists(

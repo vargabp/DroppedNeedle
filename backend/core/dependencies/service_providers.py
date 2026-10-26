@@ -56,6 +56,7 @@ from .repo_providers import (
     get_user_connections_store,
     get_user_listening_prefs_store,
     get_play_history_store,
+    get_scrobble_outbox_store,
     get_follow_store,
     get_github_repository,
 )
@@ -2410,6 +2411,7 @@ def get_scrobble_service() -> "ScrobbleService":
         client_factory=get_per_user_client_factory(),
         listening_prefs_store=get_user_listening_prefs_store(),
         play_history_store=get_play_history_store(),
+        scrobble_outbox_store=get_scrobble_outbox_store(),
         plugin_host=get_plugin_host(),
     )
 

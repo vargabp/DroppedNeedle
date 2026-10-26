@@ -210,6 +210,7 @@ def get_target_consumer_composition() -> "TargetConsumerComposition":
     )
     from .repo_providers import (
         get_request_history_store,
+        get_scrobble_outbox_store,
         get_target_coverart_repository,
         get_user_listening_prefs_store,
     )
@@ -228,6 +229,7 @@ def get_target_consumer_composition() -> "TargetConsumerComposition":
         cache_dir=get_settings().cache_dir,
         client_factory=get_per_user_client_factory(),
         listening_prefs_store=get_user_listening_prefs_store(),
+        scrobble_outbox_store=get_scrobble_outbox_store(),
         now_playing=get_now_playing_service(),
         request_history=get_request_history_store(),
         plugin_host=get_plugin_host(),

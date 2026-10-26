@@ -31,6 +31,7 @@ FROM python:3.13.5-slim
 ARG COMMIT_TAG
 ARG BUILD_DATE
 ARG DROPPEDNEEDLE_SOURCE_REVISION=unknown
+ARG DROPPEDNEEDLE_UPSTREAM_VERSION
 
 LABEL org.opencontainers.image.title="DroppedNeedle" \
       org.opencontainers.image.description="Music request and discovery app with a built-in native library + download engine" \
@@ -39,7 +40,8 @@ LABEL org.opencontainers.image.title="DroppedNeedle" \
       org.opencontainers.image.version="${COMMIT_TAG}" \
       org.opencontainers.image.created="${BUILD_DATE}" \
       org.opencontainers.image.licenses="AGPL-3.0" \
-      org.droppedneedle.source-revision="${DROPPEDNEEDLE_SOURCE_REVISION}"
+      org.droppedneedle.source-revision="${DROPPEDNEEDLE_SOURCE_REVISION}" \
+      org.droppedneedle.upstream-version="${DROPPEDNEEDLE_UPSTREAM_VERSION}"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -48,7 +50,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     DROPPEDNEEDLE_STATIC_DIR=/app/cache/frontend-static \
     COMMIT_TAG=${COMMIT_TAG} \
     BUILD_DATE=${BUILD_DATE} \
-    DROPPEDNEEDLE_SOURCE_REVISION=${DROPPEDNEEDLE_SOURCE_REVISION}
+    DROPPEDNEEDLE_SOURCE_REVISION=${DROPPEDNEEDLE_SOURCE_REVISION} \
+    DROPPEDNEEDLE_UPSTREAM_VERSION=${DROPPEDNEEDLE_UPSTREAM_VERSION}
 
 WORKDIR /app
 

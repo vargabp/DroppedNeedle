@@ -433,6 +433,41 @@ def start_discover_home_warmer_task(
     return task
 
 
+async def retry_listenbrainz_scrobbles_periodically(
+    scrobble_service,
+    *,
+    interval: float = 30.0,
+    startup_delay: float = 10.0,
+) -> None:
+    """Drain durable completed-listen deliveries without blocking playback."""
+    await asyncio.sleep(startup_delay)
+    while True:
+        try:
+            delivered, deferred = await scrobble_service.retry_pending_listenbrainz()
+            if delivered:
+                logger.info(
+                    "ListenBrainz scrobble retry delivered=%d deferred=%d",
+                    delivered,
+                    deferred,
+                )
+        except asyncio.CancelledError:
+            break
+        except Exception:  # noqa: BLE001 - durable queue survives one failed sweep
+            logger.exception("ListenBrainz scrobble retry sweep failed")
+        try:
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            break
+
+
+def start_listenbrainz_scrobble_retry_task(scrobble_service) -> asyncio.Task:
+    task = asyncio.create_task(
+        retry_listenbrainz_scrobbles_periodically(scrobble_service)
+    )
+    TaskRegistry.get_instance().register("listenbrainz-scrobble-retry", task)
+    return task
+
+
 _AUDIODB_SWEEP_INTERVAL = 86400
 _AUDIODB_SWEEP_INITIAL_DELAY = 120
 _AUDIODB_SWEEP_MAX_ITEMS = 5000

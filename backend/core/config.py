@@ -4,6 +4,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Self
 import logging
 import os
+import re
 import msgspec
 from core.base_path import normalize_base_path
 from core.exceptions import ConfigurationError
@@ -12,6 +13,7 @@ from infrastructure.file_utils import atomic_write_json, read_json
 logger = logging.getLogger(__name__)
 
 _VALID_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
+_HTTP_PRODUCT_VERSION_RE = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]+$")
 _PREFERENCES_OWNED_CONFIG_KEYS = frozenset(
     {
         "_internal",
@@ -78,7 +80,7 @@ class Settings(BaseSettings):
         ),
     )
     listenbrainz_rate_limit: float = Field(
-        default=2.5,
+        default=1.0,
         gt=0.0,
         le=1000.0,
         description="Process-wide ListenBrainz request rate in requests per second.",
@@ -222,14 +224,30 @@ class Settings(BaseSettings):
 
         return self
     
-    def get_user_agent(self) -> str:
-        version = os.environ.get("COMMIT_TAG", "dev")
+    @staticmethod
+    def _build_version(environment_name: str, fallback: str = "dev") -> str:
+        version = os.environ.get(environment_name, "").strip()
+        if version and _HTTP_PRODUCT_VERSION_RE.fullmatch(version):
+            return version
+        return fallback
+
+    def _format_user_agent(self, version: str) -> str:
         id_part = self.instance_id[:8] if self.instance_id else "unknown"
         email = (self.contact_email or "").strip() or "contact@droppedneedle.com"
         return f"DroppedNeedleApp/{version} ({id_part}; {email}; https://www.droppedneedle.com)"
 
+    def get_user_agent(self) -> str:
+        return self._format_user_agent(self._build_version("COMMIT_TAG"))
+
     def get_listenbrainz_user_agent(self) -> str:
-        return self.listenbrainz_user_agent or self.get_user_agent()
+        if self.listenbrainz_user_agent:
+            return self.listenbrainz_user_agent
+        build_version = self._build_version("COMMIT_TAG")
+        upstream_version = self._build_version(
+            "DROPPEDNEEDLE_UPSTREAM_VERSION",
+            fallback=build_version,
+        )
+        return self._format_user_agent(upstream_version)
 
     def load_from_file(self) -> None:
         if not self.config_file_path.exists():

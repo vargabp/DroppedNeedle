@@ -5,6 +5,11 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock
 
 from api.v1.schemas.scrobble import NowPlayingRequest, ScrobbleRequest
+from core.exceptions import RateLimitedError
+from infrastructure.persistence.scrobble_outbox_store import (
+    ListenBrainzOutboxEnqueueResult,
+    PendingListenBrainzScrobble,
+)
 from infrastructure.persistence.user_listening_prefs_store import UserListeningPrefsRecord
 from services.navidrome_playback_service import NavidromePlaybackService
 from services.scrobble_service import ScrobbleService
@@ -33,6 +38,7 @@ def _make_service(
     scrobble_lastfm: bool = True,
     scrobble_lb: bool = True,
     navidrome_handles_external: bool = False,
+    durable_outbox: bool = False,
 ):
     lastfm_repo = AsyncMock()
     lb_repo = AsyncMock()
@@ -44,7 +50,17 @@ def _make_service(
         scrobble_lastfm, scrobble_lb, navidrome_handles_external
     )
     history_store = AsyncMock()
-    service = ScrobbleService(factory, prefs_store, history_store)
+    history_store.insert.return_value = "history-1"
+    history_store.insert_with_listenbrainz_outbox.return_value = (
+        ListenBrainzOutboxEnqueueResult("history-1", True, "pending")
+    )
+    outbox_store = AsyncMock() if durable_outbox else None
+    service = ScrobbleService(
+        factory,
+        prefs_store,
+        history_store,
+        scrobble_outbox_store=outbox_store,
+    )
     return service, lastfm_repo, lb_repo, factory, prefs_store, history_store
 
 
@@ -280,6 +296,112 @@ class TestSubmitScrobble:
         await service.submit_scrobble(_scrobble_req(source="local"), user_id="u")
         lastfm.scrobble.assert_awaited_once()
         lb.submit_single_listen.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_completed_listen_is_outboxed_before_delivery_and_removed_on_success(self):
+        service, _, lb, *_ = _make_service(durable_outbox=True)
+        outbox = service._scrobble_outbox_store
+
+        await service.submit_scrobble(_scrobble_req(), user_id="u")
+
+        service._play_history_store.insert_with_listenbrainz_outbox.assert_awaited_once()
+        service._play_history_store.insert.assert_not_awaited()
+        lb.submit_single_listen.assert_awaited_once()
+        outbox.mark_delivered.assert_awaited_once_with("history-1")
+        outbox.defer.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_rate_limited_completed_listen_remains_due_for_retry(self):
+        service, _, lb, *_ = _make_service(durable_outbox=True)
+        outbox = service._scrobble_outbox_store
+        lb.submit_single_listen.side_effect = RateLimitedError(
+            "limited", retry_after_seconds=45
+        )
+
+        result = await service.submit_scrobble(_scrobble_req(), user_id="u")
+
+        assert result.accepted is True
+        assert result.services["listenbrainz"].success is False
+        assert result.services["listenbrainz"].status == "pending"
+        delay = outbox.defer.await_args.kwargs["delay_seconds"]
+        assert delay >= 45.0
+        assert outbox.defer.await_args.args == ("history-1",)
+        assert outbox.defer.await_args.kwargs["increment_attempts"] is True
+        outbox.mark_delivered.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_retry_worker_uses_current_connection_and_removes_success(self):
+        service, _, lb, *_ = _make_service(durable_outbox=True)
+        outbox = service._scrobble_outbox_store
+        outbox.due.return_value = [
+            PendingListenBrainzScrobble(
+                play_history_id="history-1",
+                user_id="u",
+                artist_name="Artist",
+                track_name="Song",
+                listened_at=1700000000,
+                album_name="Album",
+                duration_ms=200_000,
+                attempts=1,
+            )
+        ]
+
+        assert await service.retry_pending_listenbrainz() == (1, 0)
+        lb.submit_single_listen.assert_awaited_once()
+        assert lb.submit_single_listen.await_args.kwargs["listened_at"] == 1700000000
+        outbox.mark_delivered.assert_awaited_once_with("history-1")
+
+    @pytest.mark.asyncio
+    async def test_restart_duplicate_uses_durable_status_without_external_call(self):
+        service, lastfm, lb, *_ = _make_service(durable_outbox=True)
+        outbox = service._scrobble_outbox_store
+        service._play_history_store.insert_with_listenbrainz_outbox.return_value = (
+            ListenBrainzOutboxEnqueueResult("history-1", False, "delivered")
+        )
+
+        result = await service.submit_scrobble(_scrobble_req(), user_id="u")
+
+        assert result.services["listenbrainz"].status == "delivered"
+        assert result.services["listenbrainz"].success is True
+        lastfm.scrobble.assert_not_awaited()
+        lb.submit_single_listen.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_permanent_error_is_not_retried(self):
+        from core.exceptions import NonRetriableExternalServiceError
+
+        service, _, lb, *_ = _make_service(durable_outbox=True)
+        outbox = service._scrobble_outbox_store
+        lb.submit_single_listen.side_effect = NonRetriableExternalServiceError(
+            "invalid token"
+        )
+
+        result = await service.submit_scrobble(_scrobble_req(), user_id="u")
+
+        assert result.services["listenbrainz"].status == "failed"
+        outbox.mark_failed.assert_awaited_once_with(
+            "history-1", error="invalid token"
+        )
+        outbox.defer.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_retry_worker_does_not_call_upstream_while_user_is_unlinked(self):
+        service, _, lb, factory, *_ = _make_service(durable_outbox=True)
+        outbox = service._scrobble_outbox_store
+        factory.resolve_listenbrainz.return_value = None
+        outbox.due.return_value = [
+            PendingListenBrainzScrobble(
+                "history-1", "u", "Artist", "Song", 1700000000, "", 0, 0
+            )
+        ]
+
+        assert await service.retry_pending_listenbrainz() == (0, 1)
+        lb.submit_single_listen.assert_not_awaited()
+        outbox.defer.assert_awaited_once_with(
+            "history-1",
+            delay_seconds=300.0,
+            increment_attempts=False,
+        )
 
 
 class TestTimestampValidation:

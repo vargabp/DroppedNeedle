@@ -69,6 +69,7 @@ def build_target_consumer_composition(
     client_factory: Any,
     listening_prefs_store: Any,
     now_playing: Any,
+    scrobble_outbox_store: Any | None = None,
     request_history: Any | None = None,
     plugin_host: Any | None = None,
 ) -> TargetConsumerComposition:
@@ -79,7 +80,11 @@ def build_target_consumer_composition(
     local_files = LocalFilesService(repository, preferences, cache)
     native_library = TargetNativeLibraryService(store)
     scrobble_service = ScrobbleService(
-        client_factory, listening_prefs_store, history, plugin_host=plugin_host
+        client_factory,
+        listening_prefs_store,
+        history,
+        scrobble_outbox_store=scrobble_outbox_store,
+        plugin_host=plugin_host,
     )
     scrobble = CompatScrobbleAdapter(scrobble_service, view, now_playing)
     playlist_repository = TargetPlaylistRepository(store)

@@ -81,6 +81,13 @@ describe('formatServiceTooltip', () => {
 		expect(result).toContain(' · ');
 	});
 
+	it('distinguishes a queued retry from a failed delivery', () => {
+		const detail = {
+			listenbrainz: { success: false, status: 'pending' as const }
+		};
+		expect(formatServiceTooltip('scrobbled', detail)).toBe('Pending retry: ListenBrainz');
+	});
+
 	it('returns "Scrobble failed" for error with no detail', () => {
 		expect(formatServiceTooltip('error', null)).toBe('Scrobble failed');
 	});

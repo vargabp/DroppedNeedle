@@ -1,4 +1,5 @@
 import time
+from typing import Literal
 
 
 from infrastructure.msgspec_fastapi import AppStruct
@@ -44,6 +45,11 @@ class ScrobbleRequest(AppStruct):
 class ServiceResult(AppStruct):
     success: bool
     error: str | None = None
+    status: Literal["delivered", "pending", "failed"] | None = None
+
+    def __post_init__(self) -> None:
+        if self.status is None:
+            self.status = "delivered" if self.success else "failed"
 
 
 class ScrobbleResponse(AppStruct):
