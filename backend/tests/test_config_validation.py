@@ -100,6 +100,16 @@ class TestLrclibDurationTolerance:
 # D. Optional operational overrides
 
 class TestOperationalOverrides:
+    @pytest.mark.parametrize("commit_tag", ["", "   "])
+    def test_blank_commit_tag_uses_valid_development_version(
+        self, monkeypatch: pytest.MonkeyPatch, commit_tag: str
+    ) -> None:
+        monkeypatch.setenv("COMMIT_TAG", commit_tag)
+
+        settings = _make_settings(_env_file=None)
+
+        assert settings.get_user_agent().startswith("DroppedNeedleApp/dev (")
+
     def test_defaults_preserve_published_behaviour(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

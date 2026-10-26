@@ -223,7 +223,7 @@ class Settings(BaseSettings):
         return self
     
     def get_user_agent(self) -> str:
-        version = os.environ.get("COMMIT_TAG", "dev")
+        version = os.environ.get("COMMIT_TAG", "").strip() or "dev"
         id_part = self.instance_id[:8] if self.instance_id else "unknown"
         email = (self.contact_email or "").strip() or "contact@droppedneedle.com"
         return f"DroppedNeedleApp/{version} ({id_part}; {email}; https://www.droppedneedle.com)"
