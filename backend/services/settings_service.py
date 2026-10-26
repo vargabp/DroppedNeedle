@@ -34,7 +34,7 @@ from infrastructure.cache.cache_keys import (
     home_prefixes,
 )
 from infrastructure.cache.memory_cache import InMemoryCache, CacheInterface
-from infrastructure.http.client import get_http_client
+from infrastructure.http.client import get_http_client, get_listenbrainz_http_client
 from repositories.jellyfin_models import JellyfinUser
 from models.release_type_policy import normalize_release_type_filters
 from infrastructure.persistence.follow_store import FollowStore
@@ -147,7 +147,7 @@ class SettingsService:
             from repositories.listenbrainz_repository import ListenBrainzRepository
 
             app_settings = get_settings()
-            http_client = get_http_client(app_settings)
+            http_client = get_listenbrainz_http_client(app_settings)
             temp_cache = InMemoryCache(max_entries=100)
 
             temp_repo = ListenBrainzRepository(

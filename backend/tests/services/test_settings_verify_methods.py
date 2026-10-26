@@ -38,7 +38,10 @@ async def test_verify_listenbrainz_does_not_reset_circuit_breaker():
 
     with (
         patch("services.settings_service.get_settings", return_value=MagicMock()),
-        patch("services.settings_service.get_http_client", return_value=MagicMock()),
+        patch(
+            "services.settings_service.get_listenbrainz_http_client",
+            return_value=MagicMock(),
+        ),
         patch(
             "repositories.listenbrainz_repository.ListenBrainzRepository"
         ) as MockRepo,
@@ -71,7 +74,10 @@ async def test_verify_listenbrainz_propagates_rate_limited_error(user_token):
 
     with (
         patch("services.settings_service.get_settings", return_value=MagicMock()),
-        patch("services.settings_service.get_http_client", return_value=MagicMock()),
+        patch(
+            "services.settings_service.get_listenbrainz_http_client",
+            return_value=MagicMock(),
+        ),
         patch(
             "repositories.listenbrainz_repository.ListenBrainzRepository"
         ) as MockRepo,
@@ -88,6 +94,41 @@ async def test_verify_listenbrainz_propagates_rate_limited_error(user_token):
     else:
         mock_repo_instance.validate_username.assert_awaited_once_with("alice")
         mock_repo_instance.validate_token.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_verify_listenbrainz_uses_dedicated_http_client():
+    from api.v1.schemas.settings import ListenBrainzConnectionSettings
+
+    service = _make_service()
+    settings = ListenBrainzConnectionSettings(
+        username="alice", user_token="secret-token"
+    )
+    app_settings = MagicMock()
+    listenbrainz_client = MagicMock()
+    mock_repo_instance = MagicMock()
+    mock_repo_instance.validate_token = AsyncMock(return_value=(True, "Token valid"))
+
+    with (
+        patch("services.settings_service.get_settings", return_value=app_settings),
+        patch(
+            "services.settings_service.get_listenbrainz_http_client",
+            return_value=listenbrainz_client,
+        ) as get_listenbrainz_client,
+        patch("services.settings_service.get_http_client") as get_default_client,
+        patch(
+            "repositories.listenbrainz_repository.ListenBrainzRepository"
+        ) as MockRepo,
+    ):
+        MockRepo.return_value = mock_repo_instance
+
+        result = await service.verify_listenbrainz(settings)
+
+    assert result.valid is True
+    get_listenbrainz_client.assert_called_once_with(app_settings)
+    get_default_client.assert_not_called()
+    MockRepo.assert_called_once()
+    assert MockRepo.call_args.kwargs["http_client"] is listenbrainz_client
 
 
 @pytest.mark.asyncio
