@@ -139,6 +139,18 @@ class Settings(BaseSettings):
     download_client_concurrent_enqueues: int = Field(
         default=1, description="Max concurrent slskd enqueues (slskd permits only one - C3)"
     )
+    download_primary_evidence_capture_enabled: bool = Field(
+        default=False,
+        description="Opt-in, observation-only primary-evidence cohort capture.",
+    )
+    download_primary_evidence_cohort_id: str = Field(
+        default="",
+        description="Fixed identifier for the prospective evidence cohort.",
+    )
+    download_primary_evidence_max_tasks: int = Field(
+        default=0,
+        description="Hard admission bound for new tasks in the evidence cohort.",
+    )
     shutdown_grace_period: float = Field(default=10.0, description="Seconds to wait for tasks on shutdown")
     
     http_timeout: float = Field(default=10.0)
