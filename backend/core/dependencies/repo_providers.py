@@ -615,6 +615,11 @@ def get_download_store() -> "DownloadStore":
     return DownloadStore(
         db_path=settings.library_db_path,
         write_lock=get_persistence_write_lock(),
+        primary_evidence_capture_enabled=(
+            settings.download_primary_evidence_capture_enabled
+        ),
+        primary_evidence_cohort_id=settings.download_primary_evidence_cohort_id,
+        primary_evidence_max_tasks=settings.download_primary_evidence_max_tasks,
     )
 
 

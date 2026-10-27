@@ -222,6 +222,20 @@ async def test_single_enqueue_arms_canonical_duration_gate(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_enqueue_records_manifest_at_selection_boundary(tmp_path: Path):
+    strategy, *_ = _strategy(tmp_path)
+    task = _single_task()
+
+    await strategy.enqueue(task, _candidate(), strict_track_duration=True)
+
+    strategy._store.record_primary_evidence_manifest.assert_awaited_once()
+    recorded = strategy._store.record_primary_evidence_manifest.await_args.args[0]
+    assert recorded.task_id == task.id
+    assert recorded.expected_tracks[0].recording_mbid == "rec-180ceef5"
+    assert recorded.target_files[0].filename == "peer/02. Arrival in Ashford.flac"
+
+
+@pytest.mark.asyncio
 async def test_single_enqueue_strict_off_keeps_peer_duration(tmp_path: Path):
     # The last-resort semantics are preserved: with strict off the peer-advertised
     # length is the expectation (never strand the user on a bad MB duration).

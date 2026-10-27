@@ -13,6 +13,7 @@ its slskd transfers by ``source_username`` + the manifest filenames.
 """
 
 import asyncio
+import re
 import sqlite3
 import threading
 import time
@@ -28,6 +29,18 @@ from infrastructure.persistence._database import (
     _decode_json,
     _encode_json,
     _safe_alter,
+)
+from infrastructure.persistence.download_primary_evidence import (
+    PRIMARY_EVIDENCE_DDL,
+    admit_task as _admit_primary_evidence_task,
+    append_event as _append_primary_evidence_event,
+    attempt_payload as _primary_attempt_payload,
+    hash_artifact as _hash_primary_artifact,
+    manifest_payload as _primary_manifest_payload,
+    request_payload as _primary_request_payload,
+    secured_artifact_payload as _primary_secured_artifact_payload,
+    task_admitted as _primary_evidence_task_admitted,
+    verify_events as _verify_primary_evidence_events,
 )
 from infrastructure.serialization import to_jsonable
 from models.download import (
@@ -555,7 +568,28 @@ _ATTEMPT_CAS_UPDATABLE = frozenset(
 
 
 class DownloadStore(PersistenceBase):
-    def __init__(self, db_path: Path, write_lock: threading.Lock) -> None:
+    def __init__(
+        self,
+        db_path: Path,
+        write_lock: threading.Lock,
+        *,
+        primary_evidence_capture_enabled: bool = False,
+        primary_evidence_cohort_id: str = "",
+        primary_evidence_max_tasks: int = 0,
+    ) -> None:
+        self._primary_evidence_capture_enabled = bool(
+            primary_evidence_capture_enabled
+        )
+        self._primary_evidence_cohort_id = primary_evidence_cohort_id.strip()
+        self._primary_evidence_max_tasks = int(primary_evidence_max_tasks)
+        if self._primary_evidence_capture_enabled:
+            if not re.fullmatch(
+                r"[a-z0-9][a-z0-9._-]{0,63}",
+                self._primary_evidence_cohort_id,
+            ):
+                raise ValueError("invalid primary evidence cohort id")
+            if not 1 <= self._primary_evidence_max_tasks <= 100:
+                raise ValueError("primary evidence max tasks must be between 1 and 100")
         super().__init__(db_path, write_lock)
         self._activity_lock = asyncio.Lock()
         self._activity_cache: OrderedDict[
@@ -730,6 +764,7 @@ class DownloadStore(PersistenceBase):
             conn.executescript(_DOWNLOAD_ACTIVITY_DDL)
             self._migrate_download_attempts(conn)
             conn.executescript(_DOWNLOAD_ATTEMPT_ACTIVITY_DDL)
+            conn.executescript(PRIMARY_EVIDENCE_DDL)
             # One-shot acquisition-snapshot backfill marker; CREATE IF NOT
             # EXISTS makes re-running _ensure_tables a no-op after marking.
             conn.executescript(_ACQUISITION_MIGRATION_DDL)
@@ -778,6 +813,112 @@ class DownloadStore(PersistenceBase):
             conn.commit()
         finally:
             conn.close()
+
+    def _append_primary_evidence(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        task_id: str,
+        event_kind: str,
+        payload: dict[str, Any],
+        captured_at: float | None = None,
+    ) -> None:
+        if not self._primary_evidence_capture_enabled:
+            return
+        _append_primary_evidence_event(
+            conn,
+            cohort_id=self._primary_evidence_cohort_id,
+            task_id=task_id,
+            event_kind=event_kind,
+            payload=payload,
+            captured_at=captured_at,
+        )
+
+    async def _is_primary_evidence_task_admitted(self, task_id: str | None) -> bool:
+        if not self._primary_evidence_capture_enabled or task_id is None:
+            return False
+
+        def operation(conn: sqlite3.Connection) -> bool:
+            return _primary_evidence_task_admitted(
+                conn, task_id, self._primary_evidence_cohort_id
+            )
+
+        return await self._read(operation)
+
+    async def list_primary_evidence_events(
+        self, task_id: str
+    ) -> list[dict[str, Any]]:
+        """Return a verified hash chain; mutation fails closed."""
+
+        def operation(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+            rows = conn.execute(
+                "SELECT * FROM download_primary_evidence_events "
+                "WHERE task_id=? ORDER BY sequence",
+                (task_id,),
+            ).fetchall()
+            return _verify_primary_evidence_events(rows)
+
+        return await self._read(operation)
+
+    async def primary_evidence_cohort_status(self) -> dict[str, Any]:
+        """Return bounded admission/terminal counts without exposing payloads."""
+
+        def operation(conn: sqlite3.Connection) -> dict[str, Any]:
+            row = conn.execute(
+                "SELECT max_tasks,opened_at,admissions_closed_at FROM "
+                "download_primary_evidence_cohorts WHERE cohort_id=?",
+                (self._primary_evidence_cohort_id,),
+            ).fetchone()
+            if row is None:
+                return {
+                    "cohort_id": self._primary_evidence_cohort_id,
+                    "max_tasks": self._primary_evidence_max_tasks,
+                    "admitted_tasks": 0,
+                    "terminal_tasks": 0,
+                    "opened_at": None,
+                    "admissions_closed_at": None,
+                }
+            counts = conn.execute(
+                "SELECT COUNT(*) AS admitted, "
+                "SUM(CASE WHEN t.status IN "
+                "('completed','partial','failed','cancelled') THEN 1 ELSE 0 END) "
+                "AS terminal FROM download_primary_evidence_admissions a "
+                "JOIN download_tasks t ON t.id=a.task_id WHERE a.cohort_id=?",
+                (self._primary_evidence_cohort_id,),
+            ).fetchone()
+            return {
+                "cohort_id": self._primary_evidence_cohort_id,
+                "max_tasks": int(row["max_tasks"]),
+                "admitted_tasks": int(counts["admitted"]),
+                "terminal_tasks": int(counts["terminal"] or 0),
+                "opened_at": row["opened_at"],
+                "admissions_closed_at": row["admissions_closed_at"],
+            }
+
+        return await self._read(operation)
+
+    async def record_primary_evidence_manifest(self, manifest: Any) -> None:
+        """Bind selected source, exact expected map and ownership at enqueue."""
+        if not self._primary_evidence_capture_enabled:
+            return
+        captured_at = time.time()
+
+        def operation(conn: sqlite3.Connection) -> None:
+            row = conn.execute(
+                "SELECT * FROM download_tasks WHERE id=?", (manifest.task_id,)
+            ).fetchone()
+            task = _row_to_task(row)
+            if task is None:
+                raise ValueError("download task missing for primary evidence")
+            self._append_primary_evidence(
+                conn,
+                task_id=task.id,
+                event_kind="selection_manifest",
+                payload=_primary_manifest_payload(conn, task, manifest, captured_at),
+                captured_at=captured_at,
+            )
+
+        await self._write(operation)
 
     def _migrate_quarantine(self, conn: sqlite3.Connection) -> None:
         """Create the quarantine table, rebuilding the old slskd-shaped schema in
@@ -955,6 +1096,22 @@ class DownloadStore(PersistenceBase):
                 f"INSERT INTO download_tasks ({columns}) VALUES ({placeholders})",
                 values,
             )
+            if self._primary_evidence_capture_enabled:
+                admitted = _admit_primary_evidence_task(
+                    conn,
+                    cohort_id=self._primary_evidence_cohort_id,
+                    max_tasks=self._primary_evidence_max_tasks,
+                    task_id=task.id,
+                    admitted_at=now,
+                )
+                if admitted:
+                    self._append_primary_evidence(
+                        conn,
+                        task_id=task.id,
+                        event_kind="request_created",
+                        payload=_primary_request_payload(conn, task, now),
+                        captured_at=now,
+                    )
 
         await self._write(operation)
         return task
@@ -1698,6 +1855,13 @@ class DownloadStore(PersistenceBase):
                     attempt.updated_at,
                 ),
             )
+            self._append_primary_evidence(
+                conn,
+                task_id=attempt.task_id,
+                event_kind="attempt_state",
+                payload=_primary_attempt_payload(attempt),
+                captured_at=timestamp,
+            )
             return attempt
 
         return await self._write(operation)
@@ -1796,6 +1960,13 @@ class DownloadStore(PersistenceBase):
             value = _row_to_attempt(row)
             if value is None:
                 raise ValueError("download attempt disappeared")
+            self._append_primary_evidence(
+                conn,
+                task_id=value.task_id,
+                event_kind="attempt_state",
+                payload=_primary_attempt_payload(value),
+                captured_at=timestamp,
+            )
             return value
 
         return await self._write(operation)
@@ -1827,7 +1998,16 @@ class DownloadStore(PersistenceBase):
                 "WHERE id=? AND row_revision=? RETURNING *",
                 tuple(params),
             ).fetchone()
-            return _row_to_attempt(row)
+            value = _row_to_attempt(row)
+            if value is not None:
+                self._append_primary_evidence(
+                    conn,
+                    task_id=value.task_id,
+                    event_kind="attempt_state",
+                    payload=_primary_attempt_payload(value),
+                    captured_at=timestamp,
+                )
+            return value
 
         return await self._write(operation)
 
@@ -1859,6 +2039,13 @@ class DownloadStore(PersistenceBase):
             value = _row_to_attempt(row)
             if value is None:
                 raise ValueError("download attempt not found")
+            self._append_primary_evidence(
+                conn,
+                task_id=value.task_id,
+                event_kind="attempt_state",
+                payload=_primary_attempt_payload(value),
+                captured_at=timestamp,
+            )
             return value
 
         return await self._write(operation)
@@ -1911,6 +2098,18 @@ class DownloadStore(PersistenceBase):
                     attempt_id,
                 ),
             )
+            row = conn.execute(
+                "SELECT * FROM download_attempts WHERE id=?", (attempt_id,)
+            ).fetchone()
+            value = _row_to_attempt(row)
+            if value is not None:
+                self._append_primary_evidence(
+                    conn,
+                    task_id=value.task_id,
+                    event_kind="attempt_state",
+                    payload=_primary_attempt_payload(value),
+                    captured_at=timestamp,
+                )
 
         await self._write(operation)
 
@@ -2384,6 +2583,26 @@ class DownloadStore(PersistenceBase):
         piling up one per edition it failed over through. Dedup needs a real track position -
         without one, two different unknown-track holds aren't the same track, so we keep both."""
         now = time.time()
+        capture_artifact = await self._is_primary_evidence_task_admitted(
+            source_task_id
+        )
+        artifact_sha256 = (
+            await asyncio.to_thread(_hash_primary_artifact, held_path)
+            if capture_artifact
+            else None
+        )
+        evidence_values = {
+            "held_path": held_path,
+            "reason": reason,
+            "source_task_id": source_task_id,
+            "release_group_mbid": release_group_mbid,
+            "release_mbid": release_mbid,
+            "release_track_mbid": release_track_mbid,
+            "recording_mbid": recording_mbid,
+            "track_number": track_number,
+            "disc_number": disc_number,
+            "original_filename": original_filename,
+        }
 
         def operation(conn: sqlite3.Connection) -> int | None:
             if track_number is not None:
@@ -2449,6 +2668,16 @@ class DownloadStore(PersistenceBase):
                     now,
                 ),
             )
+            if capture_artifact and source_task_id is not None:
+                self._append_primary_evidence(
+                    conn,
+                    task_id=source_task_id,
+                    event_kind="secured_artifact",
+                    payload=_primary_secured_artifact_payload(
+                        evidence_values, artifact_sha256
+                    ),
+                    captured_at=now,
+                )
             return cur.lastrowid
 
         return await self._write(operation)
@@ -2479,6 +2708,19 @@ class DownloadStore(PersistenceBase):
 
         user_id, source_task_id = next(iter(ownership))
         now = time.time()
+        capture_artifacts = await self._is_primary_evidence_task_admitted(
+            source_task_id
+        )
+        artifact_hashes = (
+            {
+                value.held_path: await asyncio.to_thread(
+                    _hash_primary_artifact, value.held_path
+                )
+                for value in held_files
+            }
+            if capture_artifacts
+            else {}
+        )
 
         def operation(conn: sqlite3.Connection) -> tuple[list[int], list[str]]:
             existing = conn.execute(
@@ -2543,6 +2785,28 @@ class DownloadStore(PersistenceBase):
                     ),
                 )
                 inserted.append(cur.lastrowid)
+                if capture_artifacts:
+                    self._append_primary_evidence(
+                        conn,
+                        task_id=source_task_id,
+                        event_kind="secured_artifact",
+                        payload=_primary_secured_artifact_payload(
+                            {
+                                "held_path": value.held_path,
+                                "reason": value.reason,
+                                "source_task_id": value.source_task_id,
+                                "release_group_mbid": value.release_group_mbid,
+                                "release_mbid": value.release_mbid,
+                                "release_track_mbid": value.release_track_mbid,
+                                "recording_mbid": value.recording_mbid,
+                                "track_number": value.track_number,
+                                "disc_number": value.disc_number,
+                                "original_filename": value.original_filename,
+                            },
+                            artifact_hashes.get(value.held_path),
+                        ),
+                        captured_at=now,
+                    )
             return inserted, [str(row["held_path"]) for row in existing]
 
         return await self._write(operation)

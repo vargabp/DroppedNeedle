@@ -426,6 +426,7 @@ class PluginSourceStrategy:
         self._staging.joinpath(task.id).mkdir(parents=True, exist_ok=True)
         manifest_path = self._staging / task.id / "manifest.json"
         manifest_path.write_bytes(self._manifest_codec.encode(manifest))
+        await self._store.record_primary_evidence_manifest(manifest)
 
         try:
             if files_mode:
