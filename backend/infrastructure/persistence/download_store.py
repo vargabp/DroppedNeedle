@@ -36,7 +36,10 @@ from infrastructure.persistence.download_primary_evidence import (
     append_event as _append_primary_evidence_event,
     attempt_payload as _primary_attempt_payload,
     hash_artifact as _hash_primary_artifact,
+    imported_artifacts_payload as _primary_imported_artifacts_payload,
     manifest_payload as _primary_manifest_payload,
+    ownership_catalog_rows as _primary_ownership_catalog_rows,
+    ownership_snapshot_from_rows as _primary_ownership_snapshot_from_rows,
     request_payload as _primary_request_payload,
     secured_artifact_payload as _primary_secured_artifact_payload,
     task_admitted as _primary_evidence_task_admitted,
@@ -845,6 +848,10 @@ class DownloadStore(PersistenceBase):
 
         return await self._read(operation)
 
+    async def primary_evidence_task_admitted(self, task_id: str | None) -> bool:
+        """Public read-only admission probe for evidence-aware import services."""
+        return await self._is_primary_evidence_task_admitted(task_id)
+
     async def list_primary_evidence_events(
         self, task_id: str
     ) -> list[dict[str, Any]]:
@@ -903,6 +910,20 @@ class DownloadStore(PersistenceBase):
             return
         captured_at = time.time()
 
+        def inspect(conn: sqlite3.Connection) -> tuple[Any, list[dict[str, Any]] | None]:
+            row = conn.execute(
+                "SELECT * FROM download_tasks WHERE id=?", (manifest.task_id,)
+            ).fetchone()
+            task = _row_to_task(row)
+            if task is None:
+                raise ValueError("download task missing for primary evidence")
+            return task, _primary_ownership_catalog_rows(conn, task)
+
+        _task, ownership_rows = await self._read(inspect)
+        ownership_snapshot = await asyncio.to_thread(
+            _primary_ownership_snapshot_from_rows, ownership_rows, captured_at
+        )
+
         def operation(conn: sqlite3.Connection) -> None:
             row = conn.execute(
                 "SELECT * FROM download_tasks WHERE id=?", (manifest.task_id,)
@@ -914,7 +935,41 @@ class DownloadStore(PersistenceBase):
                 conn,
                 task_id=task.id,
                 event_kind="selection_manifest",
-                payload=_primary_manifest_payload(conn, task, manifest, captured_at),
+                payload=_primary_manifest_payload(
+                    conn,
+                    task,
+                    manifest,
+                    captured_at,
+                    ownership_snapshot=ownership_snapshot,
+                ),
+                captured_at=captured_at,
+            )
+
+        await self._write(operation)
+
+    async def record_primary_evidence_import_artifacts(
+        self,
+        task_id: str,
+        *,
+        bundle_id: str,
+        repeated: bool,
+        artifacts: list[dict[str, Any]],
+    ) -> None:
+        """Append v2 proof for a successfully published admitted import bundle."""
+        if not await self._is_primary_evidence_task_admitted(task_id):
+            return
+        captured_at = time.time()
+
+        def operation(conn: sqlite3.Connection) -> None:
+            self._append_primary_evidence(
+                conn,
+                task_id=task_id,
+                event_kind="attempt_state",
+                payload=_primary_imported_artifacts_payload(
+                    bundle_id=bundle_id,
+                    repeated=repeated,
+                    artifacts=artifacts,
+                ),
                 captured_at=captured_at,
             )
 

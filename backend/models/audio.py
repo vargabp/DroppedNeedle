@@ -109,6 +109,11 @@ class FingerprintResult(AppStruct):
     # Populated only on ``pass``; ``recording_id`` remains the first valid candidate
     # and is retained for consumers that need the selected/top match.
     recording_ids: list[str] = msgspec.field(default_factory=list)
+    # SHA-256 of the exact Chromaprint string submitted to AcoustID. The raw
+    # fingerprint is deliberately not persisted or exported. This binds a
+    # matched recording result to the audio-derived input without treating a
+    # byte hash, filename, duration, or tag as recording identity.
+    fingerprint_sha256: str | None = None
     # F-044: True when fpcalc exited non-zero yet still emitted a fingerprint
     # (a truncated/corrupt decode produced a PREFIX fingerprint). Callers that
     # act on a confident match may require corroboration; genuine short

@@ -259,14 +259,17 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
     )
 
 
-def _ownership_snapshot(conn: sqlite3.Connection, task: Any, captured_at: float) -> dict[str, Any]:
+def ownership_catalog_rows(
+    conn: sqlite3.Connection, task: Any
+) -> list[dict[str, Any]] | None:
+    """Return the exact catalogue rows to inspect outside the DB transaction.
+
+    File hashing is deliberately not performed while the shared SQLite write lock is
+    held.  ``None`` distinguishes a missing native catalogue from a complete empty
+    observation (no matching owned tracks).
+    """
     if not _table_exists(conn, "local_tracks"):
-        return {
-            "captured_at": captured_at,
-            "complete": False,
-            "missing_evidence": ["native_local_tracks_table"],
-            "tracks": [],
-        }
+        return None
     if task.download_type == "track" and task.recording_mbid:
         where = "LOWER(COALESCE(embedded_recording_mbid,''))=LOWER(?)"
         params: tuple[Any, ...] = (task.recording_mbid,)
@@ -276,20 +279,66 @@ def _ownership_snapshot(conn: sqlite3.Connection, task: Any, captured_at: float)
             "OR LOWER(COALESCE(embedded_release_mbid,''))=LOWER(?)"
         )
         params = (task.release_group_mbid, task.release_mbid or "")
+    columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(local_tracks)").fetchall()
+    }
+    position_columns = (
+        ",disc_number,track_number"
+        if {"disc_number", "track_number"} <= columns
+        else ""
+    )
     rows = conn.execute(
         "SELECT id,file_path,path_hash,file_size_bytes,file_mtime_ns,stat_revision,"
         "stat_revision_kind,availability,embedded_release_group_mbid,"
-        "embedded_release_mbid,embedded_recording_mbid,embedded_release_track_mbid "
+        "embedded_release_mbid,embedded_recording_mbid,embedded_release_track_mbid"
+        f"{position_columns} "
         f"FROM local_tracks WHERE {where} ORDER BY id",
         params,
     ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def ownership_snapshot_from_rows(
+    rows: list[dict[str, Any]] | None, captured_at: float
+) -> dict[str, Any]:
+    """Bind catalogue identity/stat evidence to stable file-content digests."""
+    if rows is None:
+        return {
+            "captured_at": captured_at,
+            "complete": False,
+            "missing_evidence": ["native_local_tracks_table"],
+            "tracks": [],
+            "content_sha256_complete": False,
+        }
     tracks = []
-    stat_failures = 0
+    missing: set[str] = set()
     for row in rows:
         path = str(row["file_path"])
-        physical = Path(path).is_file()
-        if not physical and row["availability"] == "indexed":
-            stat_failures += 1
+        physical = False
+        content_sha256 = None
+        stable_stat = False
+        try:
+            before = Path(path).stat()
+            physical = Path(path).is_file()
+            if physical:
+                content_sha256 = hash_artifact(path)
+                after = Path(path).stat()
+                stable_stat = (
+                    before.st_size == after.st_size == int(row["file_size_bytes"])
+                    and before.st_mtime_ns
+                    == after.st_mtime_ns
+                    == int(row["file_mtime_ns"])
+                )
+        except (OSError, TypeError, ValueError):
+            pass
+        if not physical:
+            missing.add("catalogued_file_not_physically_present")
+        elif content_sha256 is None:
+            missing.add("content_sha256_unavailable")
+        elif not stable_stat:
+            content_sha256 = None
+            missing.add("file_changed_during_ownership_capture")
         tracks.append(
             {
                 "local_track_id": row["id"],
@@ -300,21 +349,69 @@ def _ownership_snapshot(conn: sqlite3.Connection, task: Any, captured_at: float)
                 "stat_revision": row["stat_revision"],
                 "stat_revision_kind": row["stat_revision_kind"],
                 "availability": row["availability"],
+                "disc_number": row.get("disc_number"),
+                "track_number": row.get("track_number"),
                 "release_group_mbid": row["embedded_release_group_mbid"],
                 "release_mbid": row["embedded_release_mbid"],
                 "recording_mbid": row["embedded_recording_mbid"],
                 "release_track_mbid": row["embedded_release_track_mbid"],
+                "content_sha256": content_sha256,
+            }
+        )
+    content_complete = all(value["content_sha256"] is not None for value in tracks)
+    return {
+        "captured_at": captured_at,
+        "complete": not missing,
+        "missing_evidence": sorted(missing),
+        "tracks": tracks,
+        "content_sha256_complete": content_complete,
+    }
+
+
+def _ownership_snapshot(
+    conn: sqlite3.Connection, task: Any, captured_at: float
+) -> dict[str, Any]:
+    rows = ownership_catalog_rows(conn, task)
+    if rows is None:
+        return {
+            "captured_at": captured_at,
+            "complete": False,
+            "missing_evidence": ["native_local_tracks_table"],
+            "tracks": [],
+            "content_sha256_complete": False,
+        }
+    tracks = []
+    missing: set[str] = set()
+    for row in rows:
+        physical = Path(str(row["file_path"])).is_file()
+        if not physical:
+            missing.add("catalogued_file_not_physically_present")
+        tracks.append(
+            {
+                "local_track_id": row["id"],
+                "path_hash": row["path_hash"],
+                "physical_exists": physical,
+                "file_size_bytes": row["file_size_bytes"],
+                "file_mtime_ns": row["file_mtime_ns"],
+                "stat_revision": row["stat_revision"],
+                "stat_revision_kind": row["stat_revision_kind"],
+                "availability": row["availability"],
+                "disc_number": row.get("disc_number"),
+                "track_number": row.get("track_number"),
+                "release_group_mbid": row["embedded_release_group_mbid"],
+                "release_mbid": row["embedded_release_mbid"],
+                "recording_mbid": row["embedded_recording_mbid"],
+                "release_track_mbid": row["embedded_release_track_mbid"],
+                "content_sha256": None,
             }
         )
     return {
         "captured_at": captured_at,
-        "complete": stat_failures == 0,
-        "missing_evidence": (
-            [] if stat_failures == 0 else ["indexed_file_not_physically_present"]
-        ),
+        "complete": not missing,
+        "missing_evidence": sorted(missing),
         "tracks": tracks,
         "content_sha256_complete": False,
-        "limitations": ["Ownership binds exact catalog and stat evidence, not audio bytes."],
+        "limitations": ["Request event does not hash files inside the DB write."],
     }
 
 
@@ -356,16 +453,31 @@ def request_payload(
 
 
 def manifest_payload(
-    conn: sqlite3.Connection, task: Any, manifest: Any, captured_at: float
+    conn: sqlite3.Connection,
+    task: Any,
+    manifest: Any,
+    captured_at: float,
+    *,
+    ownership_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     tracks = [to_jsonable(value) for value in manifest.expected_tracks]
     recordings = [value.get("recording_mbid") for value in tracks]
     release_tracks = [value.get("release_track_mbid") for value in tracks]
+    positions = [
+        (value.get("disc_number"), value.get("track_number")) for value in tracks
+    ]
     map_complete = (
         bool(tracks)
         and all(recordings)
         and all(release_tracks)
-        and len(set(recordings)) == len(recordings)
+        and all(
+            isinstance(disc, int)
+            and disc >= 1
+            and isinstance(track, int)
+            and track >= 1
+            for disc, track in positions
+        )
+        and len(set(positions)) == len(positions)
         and len(set(release_tracks)) == len(release_tracks)
     )
     files = []
@@ -381,8 +493,11 @@ def manifest_payload(
             }
         )
     payload = request_payload(conn, task, captured_at)
+    if ownership_snapshot is not None:
+        payload["ownership_snapshot"] = ownership_snapshot
     payload.update(
         {
+            "schema_version": 2,
             "selected_candidate": {
                 "search_job_id": task.search_job_id,
                 "candidate_index": task.candidate_index,
@@ -400,6 +515,43 @@ def manifest_payload(
         }
     )
     return payload
+
+
+def imported_artifacts_payload(
+    *, bundle_id: str, repeated: bool, artifacts: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Describe successfully published bytes without granting execution authority."""
+    identity_complete = bool(artifacts) and all(
+        value.get(key)
+        for value in artifacts
+        for key in ("release_mbid", "recording_mbid", "release_track_mbid")
+    )
+    artifact_hash_complete = bool(artifacts) and all(
+        value.get("content_sha256") for value in artifacts
+    )
+    fingerprint_complete = bool(artifacts) and all(
+        value.get("fingerprint_sha256")
+        and value.get("fingerprint_status") == "pass"
+        and value.get("fingerprint_recording_mbid") == value.get("recording_mbid")
+        and value.get("fingerprint_partial_decode") is False
+        for value in artifacts
+    )
+    return {
+        "schema_version": 2,
+        "observation_kind": "published_import_artifacts",
+        "bundle_id": bundle_id,
+        "publisher_repeated": repeated,
+        "artifacts": artifacts,
+        "identity_complete": identity_complete,
+        "artifact_hash_complete": artifact_hash_complete,
+        "fingerprint_proof_complete": fingerprint_complete,
+        "observation_complete": (
+            identity_complete and artifact_hash_complete and fingerprint_complete
+        ),
+        "review_label": None,
+        "execution_authorized": False,
+        "permissions": {"import": False, "retry": False, "delete": False, "acquire": False},
+    }
 
 
 def attempt_payload(attempt: Any) -> dict[str, Any]:
