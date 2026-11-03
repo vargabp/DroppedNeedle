@@ -192,6 +192,29 @@ def _echo_duration(result: FingerprintResult, duration: int) -> FingerprintResul
     return FingerprintResult(**values)
 
 
+def _bind_fingerprint(result: FingerprintResult, fingerprint: str) -> FingerprintResult:
+    """Return the lookup result bound to the exact submitted Chromaprint."""
+    values = {
+        field: getattr(result, field)
+        for field in (
+            "status",
+            "score",
+            "recording_id",
+            "recording_ids",
+            "title",
+            "artist",
+            "duration",
+            "error",
+            "release_group_ids",
+            "partial_decode",
+        )
+    }
+    values["fingerprint_sha256"] = hashlib.sha256(
+        fingerprint.encode("utf-8")
+    ).hexdigest()
+    return FingerprintResult(**values)
+
+
 class AudioFingerprinter:
     ACOUSTID_API = "https://api.acoustid.org/v2/lookup"
 
@@ -226,7 +249,7 @@ class AudioFingerprinter:
         result = await self.lookup_fingerprint(fingerprint, duration)
         if partial:
             result = _echo_partial(result)
-        return result
+        return _bind_fingerprint(result, fingerprint)
 
     def is_enabled(self) -> bool:
         return bool(self._api_key_provider())

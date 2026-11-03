@@ -2,6 +2,7 @@
 (Phase 7 import pipeline)."""
 
 import asyncio
+import hashlib
 import shutil
 import threading
 from pathlib import Path
@@ -385,6 +386,82 @@ async def test_hold_conversion_bundle_passes_required_evidence_kwargs(
     assert kwargs["evidence_title"] == "Airbag"
     assert kwargs["evidence_artist"] == "Radiohead"
     assert kwargs["evidence_score"] == 0.97
+
+
+@pytest.mark.asyncio
+async def test_publisher_records_v2_artifact_proof_only_for_admitted_task(
+    tmp_path: Path,
+) -> None:
+    library = tmp_path / "library"
+    library.mkdir()
+    source = tmp_path / "source.flac"
+    source.write_bytes(b"published-audio")
+    target = library / "Artist" / "Album" / "01 Track.flac"
+
+    async def publish(bundle):
+        target.parent.mkdir(parents=True)
+        shutil.move(bundle.files[0].input_path, target)
+        return LibraryManagementImportResult(
+            bundle_id="bundle-v2",
+            paths=(str(target),),
+            local_track_ids=("local-1",),
+        )
+
+    store = AsyncMock(spec=DownloadStore)
+    store.primary_evidence_task_admitted.return_value = True
+    processor = FileProcessor(
+        AudioTagger(),
+        library_paths=[library],
+        library_root_ids=["root-a"],
+        download_store=store,
+        publish_import_bundle=publish,
+        policy_revision_getter=lambda: "policy-1",
+    )
+    planned = _PlannedImport(
+        source=source,
+        target=target,
+        tag=AudioTag(
+            title="Track", artist="Artist", album="Album", track_number=1
+        ),
+        info=AudioInfo(
+            duration_seconds=180.0,
+            bitrate=900,
+            sample_rate=44_100,
+            channels=2,
+            file_format="flac",
+            file_size_bytes=source.stat().st_size,
+        ),
+        release_group_mbid="11111111-1111-4111-8111-111111111111",
+        release_mbid="22222222-2222-4222-8222-222222222222",
+        recording_mbid="33333333-3333-4333-8333-333333333333",
+        release_track_mbid="44444444-4444-4444-8444-444444444444",
+        medium_position=1,
+        release_track_position=1,
+        authoritative_mapping=True,
+        confidence=1.0,
+        download_task_id="task-1",
+        source_path=str(source),
+        fingerprint_sha256="b" * 64,
+        fingerprint_status="pass",
+        fingerprint_recording_mbid="33333333-3333-4333-8333-333333333333",
+        fingerprint_score=0.99,
+        fingerprint_partial_decode=False,
+    )
+
+    result = await processor._publish_planned_imports(
+        [planned], idempotency_key="test-v2"
+    )
+
+    assert result.bundle_id == "bundle-v2"
+    store.record_primary_evidence_import_artifacts.assert_awaited_once()
+    kwargs = store.record_primary_evidence_import_artifacts.await_args.kwargs
+    artifact = kwargs["artifacts"][0]
+    assert artifact["content_sha256"] == hashlib.sha256(
+        b"published-audio"
+    ).hexdigest()
+    assert artifact["fingerprint_status"] == "pass"
+    assert artifact["fingerprint_recording_mbid"] == artifact["recording_mbid"]
+    assert "source_path" not in artifact
 
 
 @pytest.mark.asyncio

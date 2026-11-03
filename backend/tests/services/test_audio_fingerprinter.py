@@ -6,6 +6,7 @@ The real fpcalc binary and the network are never touched.
 """
 
 import asyncio
+import hashlib
 import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -125,6 +126,10 @@ async def test_pass_returns_recording_match(monkeypatch):
     assert res.recording_id == "rec-1"
     assert res.title == "Airbag"
     assert res.artist == "Radiohead"
+    assert res.fingerprint_sha256 == hashlib.sha256(
+        b"AQADtMmSaEkSRYkG"
+    ).hexdigest()
+    assert res.partial_decode is False
 
 
 def test_parse_pass_skips_malformed_recordings_and_collects_candidates():

@@ -206,6 +206,22 @@ class _PlannedImport(NamedTuple):
     source_path: str
     replacement: dict | None = None
     reviewed_recording_identity: bool = False
+    fingerprint_sha256: str | None = None
+    fingerprint_status: str | None = None
+    fingerprint_recording_mbid: str | None = None
+    fingerprint_score: float | None = None
+    fingerprint_partial_decode: bool | None = None
+
+
+def _content_sha256(path: Path) -> str | None:
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            while chunk := source.read(1024 * 1024):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
 
 
 def _filename_track_number(path: Path) -> int | None:
@@ -862,6 +878,19 @@ class FileProcessor:
         revision_getter = self._policy_revision_getter
         if publisher is None or revision_getter is None:
             raise RuntimeError("The shared import publisher is not configured.")
+        admitted_tasks: set[str] = set()
+        if self._download_store is not None:
+            for task_id in {
+                value.download_task_id for value in planned if value.download_task_id
+            }:
+                try:
+                    if await self._download_store.primary_evidence_task_admitted(task_id):
+                        admitted_tasks.add(task_id)
+                except Exception:  # noqa: BLE001 - evidence must not break publication
+                    logger.exception(
+                        "primary_evidence.admission_probe_failed",
+                        extra={"task_id": task_id},
+                    )
         requests: list[LibraryManagementImportFile] = []
         for ordinal, value in enumerate(planned):
             root_id, relative_path = self._target_location(value.target)
@@ -914,6 +943,60 @@ class FileProcessor:
                 files=tuple(requests),
             )
         )
+        if admitted_tasks and self._download_store is not None:
+            by_task: dict[str, list[dict]] = {task_id: [] for task_id in admitted_tasks}
+            if len(result.paths) != len(planned):
+                logger.error(
+                    "primary_evidence.publisher_path_count_mismatch",
+                    extra={"planned": len(planned), "published": len(result.paths)},
+                )
+            else:
+                for value, destination in zip(planned, result.paths, strict=True):
+                    planned_task_id = value.download_task_id
+                    if (
+                        planned_task_id is None
+                        or planned_task_id not in admitted_tasks
+                    ):
+                        continue
+                    content_sha256 = await asyncio.to_thread(
+                        _content_sha256, Path(destination)
+                    )
+                    by_task[planned_task_id].append(
+                        {
+                            "path_sha256": hashlib.sha256(
+                                str(destination).encode("utf-8")
+                            ).hexdigest(),
+                            "content_sha256": content_sha256,
+                            "release_group_mbid": value.release_group_mbid,
+                            "release_mbid": value.release_mbid,
+                            "recording_mbid": value.recording_mbid,
+                            "release_track_mbid": value.release_track_mbid,
+                            "disc_number": value.medium_position,
+                            "track_number": value.release_track_position,
+                            "fingerprint_sha256": value.fingerprint_sha256,
+                            "fingerprint_status": value.fingerprint_status,
+                            "fingerprint_recording_mbid": (
+                                value.fingerprint_recording_mbid
+                            ),
+                            "fingerprint_score": value.fingerprint_score,
+                            "fingerprint_partial_decode": (
+                                value.fingerprint_partial_decode
+                            ),
+                        }
+                    )
+            for task_id, artifacts in by_task.items():
+                try:
+                    await self._download_store.record_primary_evidence_import_artifacts(
+                        task_id,
+                        bundle_id=result.bundle_id,
+                        repeated=result.repeated,
+                        artifacts=artifacts,
+                    )
+                except Exception:  # noqa: BLE001 - evidence must not break publication
+                    logger.exception(
+                        "primary_evidence.artifact_capture_failed",
+                        extra={"task_id": task_id, "bundle_id": result.bundle_id},
+                    )
         for value in planned:
             self._prune_empty_source_dirs(value.source)
         return result
@@ -1611,6 +1694,13 @@ class FileProcessor:
             download_task_id=manifest.task_id,
             source_path=str(source),
             replacement=replacement,
+            fingerprint_sha256=getattr(fp, "fingerprint_sha256", None),
+            fingerprint_status=getattr(fp, "status", None),
+            fingerprint_recording_mbid=getattr(fp, "recording_id", None),
+            fingerprint_score=getattr(fp, "score", None),
+            fingerprint_partial_decode=(
+                getattr(fp, "partial_decode", None) if fp is not None else None
+            ),
         )
 
     # Replace-on-import (CollectionManagement D4/D18/D19)
@@ -2562,6 +2652,13 @@ class FileProcessor:
             download_task_id=manifest.task_id,
             source_path=str(source),
             replacement=replacement,
+            fingerprint_sha256=getattr(fp, "fingerprint_sha256", None),
+            fingerprint_status=getattr(fp, "status", None),
+            fingerprint_recording_mbid=getattr(fp, "recording_id", None),
+            fingerprint_score=getattr(fp, "score", None),
+            fingerprint_partial_decode=(
+                getattr(fp, "partial_decode", None) if fp is not None else None
+            ),
         )
 
     def _prune_empty_source_dirs(self, source: Path) -> None:

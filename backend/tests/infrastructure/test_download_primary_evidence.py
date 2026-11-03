@@ -197,6 +197,15 @@ async def test_request_binds_exact_intent_and_original_ownership(tmp_path: Path)
     assert payload["review_label"] is None
     assert set(payload["permissions"].values()) == {False}
 
+    await store.record_primary_evidence_manifest(_manifest(task.id))
+    manifest_payload = (await store.list_primary_evidence_events(task.id))[1]["payload"]
+    ownership = manifest_payload["ownership_snapshot"]
+    assert ownership["complete"] is True
+    assert ownership["content_sha256_complete"] is True
+    assert ownership["tracks"][0]["content_sha256"] == hashlib.sha256(
+        b"owned-audio"
+    ).hexdigest()
+
 
 @pytest.mark.asyncio
 async def test_manifest_and_attempt_extend_verified_chain(tmp_path: Path):
@@ -232,6 +241,11 @@ async def test_manifest_and_attempt_extend_verified_chain(tmp_path: Path):
         "attempt_state",
     ]
     assert events[1]["payload"]["recording_map_complete"] is True
+    assert events[1]["payload"]["schema_version"] == 2
+    assert events[1]["payload"]["ownership_snapshot"]["content_sha256_complete"] is False
+    assert events[1]["payload"]["ownership_snapshot"]["missing_evidence"] == [
+        "native_local_tracks_table"
+    ]
     assert events[-1]["payload"]["materialization_hash_complete"] is True
     assert events[-1]["previous_event_sha256"] == events[-2]["event_sha256"]
 
@@ -294,6 +308,31 @@ async def test_export_refuses_incomplete_then_seals_terminal_cohort(tmp_path: Pa
         export_cohort(store.db_path, COHORT, output)
 
     second = await _task(store, recording_mbid="recording-2")
+    await store.record_primary_evidence_manifest(_manifest(first.id))
+    content_sha256 = "a" * 64
+    fingerprint_sha256 = "b" * 64
+    await store.record_primary_evidence_import_artifacts(
+        first.id,
+        bundle_id="bundle-1",
+        repeated=False,
+        artifacts=[
+            {
+                "path_sha256": "c" * 64,
+                "content_sha256": content_sha256,
+                "release_group_mbid": GROUP,
+                "release_mbid": RELEASE,
+                "recording_mbid": RECORDING,
+                "release_track_mbid": RELEASE_TRACK,
+                "disc_number": 1,
+                "track_number": 1,
+                "fingerprint_sha256": fingerprint_sha256,
+                "fingerprint_status": "pass",
+                "fingerprint_recording_mbid": RECORDING,
+                "fingerprint_score": 0.99,
+                "fingerprint_partial_decode": False,
+            }
+        ],
+    )
     await store.update_status(first.id, "completed")
     with pytest.raises(ValueError, match="non-terminal"):
         export_cohort(store.db_path, COHORT, output)
@@ -309,4 +348,20 @@ async def test_export_refuses_incomplete_then_seals_terminal_cohort(tmp_path: Pa
         "failed",
     ]
     assert (output / "case-001.json").is_file()
+    evaluation = json.loads(
+        (output / "evaluation-bundle.json").read_text(encoding="utf-8")
+    )
+    first_evidence = evaluation["cases"][0]["host_evidence"]
+    assert first_evidence["schema"] == "droppedneedle-host-evidence-v2"
+    assert first_evidence["selection"]["record"]["complete"] is True
+    assert first_evidence["artifact"]["record"]["observation_complete"] is True
+    assert first_evidence["request"]["record"]["expected_recording_map"][0] == {
+        "disc_number": 1,
+        "track_number": 1,
+        "recording_mbid": RECORDING,
+        "release_track_mbid": RELEASE_TRACK,
+    }
+    assert manifest["evaluation_bundle"]["sha256"] == seal[
+        "evaluation_bundle_sha256"
+    ]
     assert (output / "seal.json").is_file()
